@@ -1,0 +1,1 @@
+python data_toolkit/download.py ObjaverseXL --root trellis.2_data/ObjaverseXL_sketchfab --world_size 1 --download_root trellis.2_data/ObjaverseXL_sketchfab

@@ -60,5 +60,6 @@ if __name__ == '__main__':
     print(f'Processing {len(metadata)} objects...')
 
     # process objects
+    opt.output_dir = opt.download_root
     downloaded = dataset_utils.download(metadata, **opt)
     downloaded.to_csv(os.path.join(opt.download_root, 'raw', 'new_records', f'part_{opt.rank}.csv'), index=False)
