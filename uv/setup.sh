@@ -1,7 +1,7 @@
 # uv cache directory resolution (evaluated at source time):
 #   1. /opt/uv-cache  – pre-populated in the remote machine image (fastest)
 #   2. <repo>/.uv-cache – persistent fallback on the network disk
-# source uv/setup.sh --new-env --venv-dir /local-ssd/vpixal3e-venv
+# source uv/setup.sh --new-env --venv-dir /local-ssd/trellis.2-venv
 pwd
 if [ -d "/opt/uv-cache" ] ; then
     export UV_CACHE_DIR="/opt/uv-cache"
