@@ -33,7 +33,7 @@ def download(metadata, output_dir, **kwargs):
     # produce unpicklable exceptions that crash multiprocessing
     import time
     file_paths = {}
-    max_retries = 10
+    max_retries = 1000
     for attempt in range(max_retries):
         remaining = annotations[~annotations['fileIdentifier'].isin(file_paths.keys())]
         if len(remaining) == 0:
@@ -49,8 +49,8 @@ def download(metadata, output_dir, **kwargs):
             file_paths.update(new_paths)
         except Exception as e:
             print(f"[download] attempt {attempt+1} crashed: {e}")
-            print(f"[download] {len(file_paths)} objects downloaded so far, sleeping 30s before retry...")
-            time.sleep(30)
+            print(f"[download] {len(file_paths)} objects downloaded so far, sleeping 120s before retry...")
+            time.sleep(120)
             continue
 
     print(f"[download] finished with {len(file_paths)} objects downloaded")

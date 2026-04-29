@@ -4,6 +4,12 @@ Usage: python data_toolkit/download_by_sha256.py --sha256_list claude_tmp/uuid_g
 """
 import os
 import sys
+
+# Avoid crash on invalid Unicode in file paths (e.g. surrogate characters in repo file names)
+os.environ.setdefault('PYTHONIOENCODING', 'utf-8:surrogateescape')
+sys.stdout.reconfigure(errors='surrogateescape')
+sys.stderr.reconfigure(errors='surrogateescape')
+
 import time
 import argparse
 import pandas as pd
@@ -62,8 +68,8 @@ def main():
             file_paths.update(new_paths)
         except Exception as e:
             print(f"[download] attempt {attempt+1} crashed: {e}")
-            print(f"[download] {len(file_paths)} downloaded so far, sleeping 30s...")
-            time.sleep(30)
+            print(f"[download] {len(file_paths)} downloaded so far, sleeping 120s...")
+            time.sleep(120)
             continue
 
     print(f"[download] finished with {len(file_paths)} objects downloaded")
