@@ -24,7 +24,8 @@ import argparse
 import json
 import os
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import Pool
+from functools import partial
 
 import numpy as np
 import torch
@@ -139,7 +140,26 @@ def save_progress(progress_path: str, progress: dict):
     os.replace(tmp_path, progress_path)
 
 
+def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions):
+    """Wrapper for Pool.imap_unordered: unpacks tuple and calls dual_grid_one_object."""
+    shard_id, obj_id = args_tuple
+    try:
+        return dual_grid_one_object(
+            shard_id=shard_id,
+            obj_id=obj_id,
+            rendered_root=rendered_root,
+            output_root=output_root,
+            resolutions=resolutions,
+        )
+    except Exception as e:
+        print(f"[ERROR] {shard_id}/{obj_id}: {e}")
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'error', 'error': str(e)}
+
+
 def main():
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--ann_file', type=str, required=True,
                         help='Path to rendering_v5_anns_8cam.json')
@@ -214,30 +234,19 @@ def main():
             progress[obj_key] = result
             save_progress(progress_path, progress)
     else:
-        # Multi-process
-        with ProcessPoolExecutor(max_workers=args.max_workers) as executor:
-            futures = {}
-            for shard_id, obj_id in to_process:
-                future = executor.submit(
-                    dual_grid_one_object,
-                    shard_id=shard_id,
-                    obj_id=obj_id,
-                    rendered_root=args.rendered_root,
-                    output_root=args.output_root,
-                    resolutions=resolutions,
-                )
-                futures[future] = (shard_id, obj_id)
-
-            with tqdm(total=len(futures), desc="Dual grid 4D") as pbar:
-                for future in as_completed(futures):
-                    shard_id, obj_id = futures[future]
-                    obj_key = f"{shard_id}/{obj_id}"
-                    try:
-                        result = future.result()
-                        progress[obj_key] = result
-                    except Exception as e:
-                        print(f"[ERROR] {obj_key}: {e}")
-                        progress[obj_key] = {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'error', 'error': str(e)}
+        # Multi-process with worker recycling to prevent memory leaks
+        worker_fn = partial(
+            _worker_wrapper,
+            rendered_root=args.rendered_root,
+            output_root=args.output_root,
+            resolutions=resolutions,
+        )
+        with Pool(processes=args.max_workers, maxtasksperchild=4) as pool:
+            results_iter = pool.imap_unordered(worker_fn, to_process)
+            with tqdm(total=len(to_process), desc="Dual grid 4D") as pbar:
+                for result in results_iter:
+                    obj_key = f"{result['shard_id']}/{result['obj_id']}"
+                    progress[obj_key] = result
                     save_progress(progress_path, progress)
                     pbar.update(1)
 
