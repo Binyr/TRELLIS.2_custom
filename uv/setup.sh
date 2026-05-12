@@ -269,8 +269,8 @@ uv pip install Kornia
 # sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
 # source .venv/bin/activate
 
-uv pip install git+https://github.com/ashawkey/cubvh.git --no-build-isolation
-uv pip install diso --no-build-isolation
+# uv pip install git+https://github.com/ashawkey/cubvh.git --no-build-isolation
+# uv pip install diso --no-build-isolation
 
 
 uv pip install objaverse
