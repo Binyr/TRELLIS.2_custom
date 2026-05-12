@@ -281,7 +281,14 @@ ln -s /efs/yanruibin/projects/video_pixal3d_train/data
 # export HF_TOKEN=your_token_here
 
 # ===== TRELLIS.2 data pipeline dependencies =====
-# o-voxel (requires nvdiffrast, cumesh, flexgemm)
+# Ensure eigen submodule is available for o-voxel build
+if [ ! -f "o-voxel/third_party/eigen/Eigen/Dense" ] ; then
+    echo "[INSTALL] Cloning Eigen for o-voxel build..."
+    rm -rf o-voxel/third_party/eigen
+    git clone --depth 1 https://gitlab.com/libeigen/eigen.git o-voxel/third_party/eigen
+fi
+
+# nvdiffrast (required by o_voxel)
 echo "[INSTALL] nvdiffrast..."
 mkdir -p /tmp/extensions
 if [ ! -d "/tmp/extensions/nvdiffrast" ] ; then
@@ -289,6 +296,7 @@ if [ ! -d "/tmp/extensions/nvdiffrast" ] ; then
 fi
 uv pip install /tmp/extensions/nvdiffrast --no-build-isolation
 
+# o-voxel (includes cumesh, flexgemm as dependencies)
 echo "[INSTALL] o-voxel..."
 uv pip install o-voxel/ --no-build-isolation
 
