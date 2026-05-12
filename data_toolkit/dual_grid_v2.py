@@ -60,9 +60,9 @@ def dual_grid_one_object(
     if not os.path.exists(mesh_npz_path):
         return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'missing_mesh', 'num_frames': 0}
 
-    mesh_data = np.load(mesh_npz_path)
-    vertices_seq = mesh_data['vertices']  # (T, N, 3) float16
-    faces = mesh_data['faces']            # (F, 3) int32
+    with np.load(mesh_npz_path) as mesh_data:
+        vertices_seq = mesh_data['vertices'].copy()  # (T, N, 3) float16
+        faces = mesh_data['faces'].copy()             # (F, 3) int32
 
     num_frames = vertices_seq.shape[0]
     faces_t = torch.from_numpy(faces).long()
@@ -111,7 +111,15 @@ def dual_grid_one_object(
                 if os.path.exists(output_path):
                     os.remove(output_path)
                 continue
+            finally:
+                # Explicitly free large tensors to prevent memory leak
+                del verts_t
+                try:
+                    del voxel_indices, dual_vertices, intersected
+                except NameError:
+                    pass
 
+    del vertices_seq, faces, faces_t
     return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'success', 'num_frames': num_frames}
 
 
