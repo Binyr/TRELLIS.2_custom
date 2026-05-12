@@ -219,6 +219,8 @@ def main():
         print("Nothing to do.")
         return
 
+    status_log_path = os.path.join(args.output_root, f'status_{args.rank}.log')
+
     # Process
     if args.max_workers <= 1:
         # Single process
@@ -233,6 +235,8 @@ def main():
             obj_key = f"{shard_id}/{obj_id}"
             progress[obj_key] = result
             save_progress(progress_path, progress)
+            with open(status_log_path, 'a') as f:
+                f.write(f"{obj_key} {result['status']} {result.get('num_frames', 0)}\n")
     else:
         # Multi-process with worker recycling to prevent memory leaks
         worker_fn = partial(
@@ -248,6 +252,8 @@ def main():
                     obj_key = f"{result['shard_id']}/{result['obj_id']}"
                     progress[obj_key] = result
                     save_progress(progress_path, progress)
+                    with open(status_log_path, 'a') as f:
+                        f.write(f"{obj_key} {result['status']} {result.get('num_frames', 0)}\n")
                     pbar.update(1)
 
     # Summary
