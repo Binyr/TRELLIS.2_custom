@@ -254,7 +254,7 @@ def main():
             output_root=args.output_root,
             resolutions=resolutions,
         )
-        with Pool(processes=args.max_workers, maxtasksperchild=4) as pool:
+        with Pool(processes=args.max_workers, maxtasksperchild=1) as pool:
             results_iter = pool.imap_unordered(worker_fn, to_process)
             with tqdm(total=len(to_process), desc="Dual grid 4D") as pbar:
                 for result in results_iter:
