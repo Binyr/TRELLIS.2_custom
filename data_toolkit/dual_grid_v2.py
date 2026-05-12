@@ -23,6 +23,7 @@ Usage:
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from multiprocessing import Pool
 from functools import partial
@@ -198,11 +199,12 @@ def main():
     entries = entries[start:end]
     print(f"Rank {args.rank}/{args.world_size}: processing {len(entries)} entries")
 
-    # Load progress
+    # Load progress (keyed by resolution to allow separate runs)
     os.makedirs(args.output_root, exist_ok=True)
-    progress_path = os.path.join(args.output_root, f'progress_{args.rank}.json')
+    res_tag = args.resolution.replace(',', '_')
+    progress_path = os.path.join(args.output_root, f'progress_{args.rank}.json') if res_tag == '512' else os.path.join(args.output_root, f'progress_{res_tag}_{args.rank}.json')
     progress = load_progress(progress_path)
-    print(f"Loaded progress: {len(progress)} completed objects")
+    print(f"Loaded progress ({progress_path}): {len(progress)} completed objects")
 
     # Filter out completed objects
     to_process = []
@@ -219,7 +221,10 @@ def main():
         print("Nothing to do.")
         return
 
-    status_log_path = os.path.join(args.output_root, f'status_{args.rank}.log')
+    status_log_path = os.path.join(args.output_root, f'status_{args.rank}.log') if res_tag == '512' else os.path.join(args.output_root, f'status_{res_tag}_{args.rank}.log')
+    total_to_process = len(to_process)
+    completed_count = 0
+    start_time = time.time()
 
     # Process
     if args.max_workers <= 1:
@@ -235,8 +240,12 @@ def main():
             obj_key = f"{shard_id}/{obj_id}"
             progress[obj_key] = result
             save_progress(progress_path, progress)
+            completed_count += 1
+            elapsed = time.time() - start_time
+            avg_per_obj = elapsed / completed_count
+            eta = avg_per_obj * (total_to_process - completed_count)
             with open(status_log_path, 'a') as f:
-                f.write(f"{obj_key} {result['status']} {result.get('num_frames', 0)}\n")
+                f.write(f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg_per_obj:.1f}s/obj eta={eta:.0f}s\n")
     else:
         # Multi-process with worker recycling to prevent memory leaks
         worker_fn = partial(
@@ -252,8 +261,12 @@ def main():
                     obj_key = f"{result['shard_id']}/{result['obj_id']}"
                     progress[obj_key] = result
                     save_progress(progress_path, progress)
+                    completed_count += 1
+                    elapsed = time.time() - start_time
+                    avg_per_obj = elapsed / completed_count
+                    eta = avg_per_obj * (total_to_process - completed_count)
                     with open(status_log_path, 'a') as f:
-                        f.write(f"{obj_key} {result['status']} {result.get('num_frames', 0)}\n")
+                        f.write(f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg_per_obj:.1f}s/obj eta={eta:.0f}s\n")
                     pbar.update(1)
 
     # Summary
