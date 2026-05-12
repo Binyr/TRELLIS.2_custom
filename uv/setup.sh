@@ -276,6 +276,28 @@ uv pip install diso --no-build-isolation
 uv pip install objaverse
 
 ln -s /threed-code/yanruibin/trellis.2_data/
-
+ln -s /efs/yanruibin/projects/video_pixal3d_train/data
 # HF_TOKEN should be set in your environment (e.g. ~/.bashrc or secrets manager)
 # export HF_TOKEN=your_token_here
+
+# ===== TRELLIS.2 data pipeline dependencies =====
+# o-voxel (requires nvdiffrast, cumesh, flexgemm)
+echo "[INSTALL] nvdiffrast..."
+mkdir -p /tmp/extensions
+if [ ! -d "/tmp/extensions/nvdiffrast" ] ; then
+    git clone -b v0.4.0 https://github.com/NVlabs/nvdiffrast.git /tmp/extensions/nvdiffrast
+fi
+uv pip install /tmp/extensions/nvdiffrast --no-build-isolation
+
+echo "[INSTALL] o-voxel..."
+uv pip install o-voxel/ --no-build-isolation
+
+# Blender (for dump_pbr_4d.py)
+echo "[INSTALL] Blender 4.5.1..."
+BLENDER_PATH="/tmp/blender-4.5.1-linux-x64/blender"
+if [ ! -f "$BLENDER_PATH" ] ; then
+    wget -q https://ftp.halifax.rwth-aachen.de/blender/release/Blender4.5/blender-4.5.1-linux-x64.tar.xz -O /tmp/blender-4.5.1-linux-x64.tar.xz
+    tar -xf /tmp/blender-4.5.1-linux-x64.tar.xz -C /tmp/
+fi
+/tmp/blender-4.5.1-linux-x64/4.5/python/bin/python3.11 -m pip install -q pillow
+echo "[DONE] Blender ready at: $BLENDER_PATH"

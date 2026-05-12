@@ -1,3 +1,6 @@
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export PYTHONCOERCECLOCALE=0
 PYTHONIOENCODING=utf-8:surrogateescape python data_toolkit/download_by_sha256.py \
   --sha256_list claude_tmp/uuid_github_intersection_sha256.txt \
   --root trellis.2_data/ObjaverseXL_github \
