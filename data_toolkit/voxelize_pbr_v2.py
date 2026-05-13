@@ -57,10 +57,8 @@ def load_progress(progress_path: str) -> dict:
 
 
 def save_progress(progress_path: str, progress: dict):
-    tmp_path = progress_path + '.tmp'
-    with open(tmp_path, 'w') as f:
+    with open(progress_path, 'w') as f:
         json.dump(progress, f)
-    os.replace(tmp_path, progress_path)
 
 
 def compute_face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:

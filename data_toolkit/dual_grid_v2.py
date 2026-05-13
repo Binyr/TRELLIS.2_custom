@@ -138,11 +138,8 @@ def load_progress(progress_path: str) -> dict:
 
 
 def save_progress(progress_path: str, progress: dict):
-    """Atomically save progress file."""
-    tmp_path = progress_path + '.tmp'
-    with open(tmp_path, 'w') as f:
+    with open(progress_path, 'w') as f:
         json.dump(progress, f)
-    os.replace(tmp_path, progress_path)
 
 
 def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions):
