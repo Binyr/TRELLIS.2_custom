@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-voxelize_pbr_v2.py - Voxelize 4D animated objects frame-by-frame.
+voxelize_pbr_v2.py - Voxelize 4D animated objects PBR frame-by-frame.
 
-Combines:
-  - pbr_shared pickle (materials, faces, UVs, mat_ids)
-  - result_mesh.npz (vertices_seq per frame)
-to produce per-frame .vxz files via o_voxel.convert.blender_dump_to_volumetric_attr().
+Combines pbr_shared pickle (materials, faces, UVs, mat_ids) with
+result_mesh.npz (vertices_seq per frame) to produce per-frame .vxz files
+via o_voxel.convert.blender_dump_to_volumetric_attr().
+
+Features:
+- Multi-process via Pool(maxtasksperchild=1)
+- Checkpoint-based resume via progress json
+- Status log with timing/ETA
+- Filter-before-shard for balanced workload
+- Priority list support
 
 Usage:
     python data_toolkit/voxelize_pbr_v2.py \
@@ -13,30 +19,29 @@ Usage:
         --pbr_shared_root data/trellis.2/pbr_shared \
         --rendered_root data/objverse_minghao_4d_mine_40075/rendering_v5 \
         --output_root data/trellis.2/pbr_voxels_4d \
-        --resolution 256 \
+        --log_root data/trellis.2/logs/voxelize_pbr_4d \
+        --resolution 512 \
+        --max_workers 8 \
         --rank 0 --world_size 1
 """
 
 import argparse
+import copy
+import glob
 import json
 import os
 import pickle
-import copy
+import sys
+import time
 from pathlib import Path
+from multiprocessing import Pool
+from functools import partial
 
 import numpy as np
-import torch
-from tqdm import tqdm
-
 import o_voxel
 
 
 def parse_entry(entry: str):
-    """
-    Parse a json entry path into shard_id and obj_id.
-    Entry: /efs/.../000-000_static_camera_distance_v3/00a1d892548542c7ab83565070737d6b
-    Returns: shard_id='000-000', obj_id='00a1d892548542c7ab83565070737d6b'
-    """
     parts = Path(entry).parts
     obj_id = parts[-1]
     shard_with_suffix = parts[-2]
@@ -44,89 +49,45 @@ def parse_entry(entry: str):
     return shard_id, obj_id
 
 
+def load_progress(progress_path: str) -> dict:
+    if os.path.exists(progress_path):
+        with open(progress_path, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+def save_progress(progress_path: str, progress: dict):
+    tmp_path = progress_path + '.tmp'
+    with open(tmp_path, 'w') as f:
+        json.dump(progress, f)
+    os.replace(tmp_path, progress_path)
+
+
 def compute_face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
-    """
-    Compute per-face normals and expand to (F, 3, 3) format expected by o_voxel.
-    Each face's 3 vertices get the same face normal.
-    """
+    """Compute per-face normals, expanded to (F, 3, 3) for o_voxel compatibility."""
     v0 = vertices[faces[:, 0]]
     v1 = vertices[faces[:, 1]]
     v2 = vertices[faces[:, 2]]
-    edge1 = v1 - v0
-    edge2 = v2 - v0
-    face_normals = np.cross(edge1, edge2)
-    norms = np.linalg.norm(face_normals, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-8)
-    face_normals = face_normals / norms
-    # Expand to (F, 3, 3): each vertex of the face gets the face normal
-    return np.stack([face_normals, face_normals, face_normals], axis=1).astype(np.float32)
+    fn = np.cross(v1 - v0, v2 - v0)
+    norms = np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1e-8)
+    fn = fn / norms
+    return np.stack([fn, fn, fn], axis=1).astype(np.float32)
 
 
-def prepare_dump_for_frame(pbr_shared: dict, frame_vertices: np.ndarray) -> dict:
-    """
-    Construct a full 'dump' dict compatible with o_voxel.convert.blender_dump_to_volumetric_attr().
-
-    pbr_shared: {'materials': [...], 'objects': [{'faces', 'uvs', 'mat_ids'}]}
-    frame_vertices: (N, 3) float32, already normalized to ~[-0.5, 0.5]
-    """
-    dump = copy.deepcopy(pbr_shared)
-
-    # Fix alpha mode (same as voxelize_pbr.py)
-    for mat in dump['materials']:
-        if mat['alphaTexture'] is not None and mat['alphaMode'] == 'OPAQUE':
-            mat['alphaMode'] = 'BLEND'
-
-    # Append default material (same as voxelize_pbr.py)
-    dump['materials'].append({
-        "baseColorFactor": [0.8, 0.8, 0.8],
-        "alphaFactor": 1.0,
-        "metallicFactor": 0.0,
-        "roughnessFactor": 0.5,
-        "alphaMode": "OPAQUE",
-        "alphaCutoff": 0.5,
-        "baseColorTexture": None,
-        "alphaTexture": None,
-        "metallicTexture": None,
-        "roughnessTexture": None,
-    })
-
-    # Build the single merged object with vertices
-    obj_data = dump['objects'][0]
-    obj_data['vertices'] = frame_vertices
-
-    # Compute normals (required by blender_dump_to_volumetric_attr, but deleted after)
-    obj_data['normals'] = compute_face_normals(frame_vertices, obj_data['faces'])
-
-    # Fix mat_ids: -1 -> default material
-    obj_data['mat_ids'] = obj_data['mat_ids'].copy()
-    obj_data['mat_ids'][obj_data['mat_ids'] == -1] = len(dump['materials']) - 1
-    assert np.all(obj_data['mat_ids'] >= 0), 'invalid mat_ids'
-
-    # Verify vertices range
-    assert np.all(frame_vertices >= -0.501) and np.all(frame_vertices <= 0.501), \
-        f'vertices out of range: min={frame_vertices.min()}, max={frame_vertices.max()}'
-
-    # Clamp to exact [-0.5, 0.5] for safety
-    obj_data['vertices'] = np.clip(frame_vertices, -0.5, 0.5)
-
-    return dump
-
-
-def voxelize_one_object(
-    shard_id: str,
-    obj_id: str,
-    pbr_shared_root: str,
-    rendered_root: str,
-    output_root: str,
-    resolutions: list,
+def voxelize_pbr_one_object(
+    args_tuple,
+    pbr_shared_root,
+    rendered_root,
+    output_root,
+    resolutions,
 ):
-    """Voxelize all frames of one object at given resolutions."""
+    """Worker function: voxelize all frames of one object."""
+    shard_id, obj_id = args_tuple
 
     # Load pbr shared data
     pbr_path = os.path.join(pbr_shared_root, shard_id, f'{obj_id}.pickle')
     if not os.path.exists(pbr_path):
-        print(f"[SKIP] PBR shared not found: {pbr_path}")
-        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'missing_pbr'}
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'missing_pbr', 'num_frames': 0}
 
     with open(pbr_path, 'rb') as f:
         pbr_shared = pickle.load(f)
@@ -135,20 +96,21 @@ def voxelize_one_object(
     rendered_dir = os.path.join(rendered_root, f'{shard_id}_static_camera_distance_v3', obj_id)
     mesh_npz_path = os.path.join(rendered_dir, 'result_mesh.npz')
     if not os.path.exists(mesh_npz_path):
-        print(f"[SKIP] mesh.npz not found: {mesh_npz_path}")
-        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'missing_mesh'}
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'missing_mesh', 'num_frames': 0}
 
-    mesh_data = np.load(mesh_npz_path)
-    vertices_seq = mesh_data['vertices']  # (T, N, 3) float16
-    frame_indices = mesh_data['frame_indices']  # (T,) int32
+    with np.load(mesh_npz_path) as mesh_data:
+        vertices_seq = mesh_data['vertices'].copy()
+        mesh_faces = mesh_data['faces'].copy()
 
-    # Verify face count consistency
-    shared_faces_from_npz = mesh_data['faces']  # (F, 3) from 4D_video_data.py
+    # Check face count
+    num_faces = mesh_faces.shape[0]
+    if num_faces > 500000:
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}
+
+    # Verify face consistency
     pbr_faces = pbr_shared['objects'][0]['faces']
-    if shared_faces_from_npz.shape != pbr_faces.shape:
-        print(f"[ERROR] Face count mismatch for {shard_id}/{obj_id}: "
-              f"mesh.npz={shared_faces_from_npz.shape}, pbr={pbr_faces.shape}")
-        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'face_mismatch'}
+    if mesh_faces.shape != pbr_faces.shape:
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'face_mismatch', 'num_frames': 0}
 
     num_frames = vertices_seq.shape[0]
 
@@ -161,56 +123,71 @@ def voxelize_one_object(
             if os.path.exists(output_path):
                 continue
 
-            # Get frame vertices
-            frame_verts = vertices_seq[frame_idx].astype(np.float32)
+            frame_verts = np.clip(vertices_seq[frame_idx].astype(np.float32), -0.5, 0.5)
+            normals = compute_face_normals(frame_verts, pbr_faces)
 
             # Build dump
-            dump = prepare_dump_for_frame(pbr_shared, frame_verts)
+            dump = copy.deepcopy(pbr_shared)
+            for mat in dump['materials']:
+                if mat.get('alphaTexture') is not None and mat['alphaMode'] == 'OPAQUE':
+                    mat['alphaMode'] = 'BLEND'
+            dump['materials'].append({
+                'baseColorFactor': [0.8, 0.8, 0.8], 'alphaFactor': 1.0,
+                'metallicFactor': 0.0, 'roughnessFactor': 0.5,
+                'alphaMode': 'OPAQUE', 'alphaCutoff': 0.5,
+                'baseColorTexture': None, 'alphaTexture': None,
+                'metallicTexture': None, 'roughnessTexture': None,
+            })
+            obj_data = dump['objects'][0]
+            obj_data['vertices'] = frame_verts
+            obj_data['normals'] = normals
+            obj_data['mat_ids'] = obj_data['mat_ids'].copy()
+            obj_data['mat_ids'][obj_data['mat_ids'] == -1] = len(dump['materials']) - 1
 
-            # Voxelize
             try:
                 coord, attr = o_voxel.convert.blender_dump_to_volumetric_attr(
-                    dump,
-                    grid_size=res,
+                    dump, grid_size=res,
                     aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                    mip_level_offset=0,
-                    verbose=False,
-                    timing=False,
+                    mip_level_offset=0, verbose=False, timing=False,
                 )
                 del attr['normal']
                 del attr['emissive']
                 o_voxel.io.write_vxz(output_path, coord, attr)
             except Exception as e:
-                print(f"[ERROR] Voxelize failed: {shard_id}/{obj_id} frame={frame_idx} res={res}: {e}")
+                print(f"[ERROR] voxelize_pbr failed: {shard_id}/{obj_id} frame={frame_idx} res={res}: {e}")
                 if os.path.exists(output_path):
                     os.remove(output_path)
                 continue
+            finally:
+                try:
+                    del coord, attr, dump, normals
+                except NameError:
+                    pass
 
+    del vertices_seq, mesh_faces, pbr_shared
     return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'success', 'num_frames': num_frames}
 
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ann_file', type=str, required=True,
-                        help='Path to rendering_v5_anns_8cam.json')
-    parser.add_argument('--pbr_shared_root', type=str, default='data/trellis.2/pbr_shared',
-                        help='Root directory of pbr_shared pickle files')
-    parser.add_argument('--rendered_root', type=str,
-                        default='data/objverse_minghao_4d_mine_40075/rendering_v5',
-                        help='Root directory of rendered data (result_mesh.npz)')
-    parser.add_argument('--output_root', type=str, default='data/trellis.2/pbr_voxels_4d',
-                        help='Output root for .vxz files')
-    parser.add_argument('--resolution', type=str, default='256',
-                        help='Comma-separated resolutions (e.g. 256,512)')
+    parser.add_argument('--ann_file', type=str, required=True)
+    parser.add_argument('--pbr_shared_root', type=str, default='data/trellis.2/pbr_shared')
+    parser.add_argument('--rendered_root', type=str, default='data/objverse_minghao_4d_mine_40075/rendering_v5')
+    parser.add_argument('--output_root', type=str, default='data/trellis.2/pbr_voxels_4d')
+    parser.add_argument('--log_root', type=str, default='data/trellis.2/logs/voxelize_pbr_4d')
+    parser.add_argument('--resolution', type=str, default='512')
     parser.add_argument('--split', type=str, default='all', choices=['train', 'test', 'all'])
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--world_size', type=int, default=1)
+    parser.add_argument('--max_workers', type=int, default=1)
+    parser.add_argument('--priority_list', type=str, default=None)
     args = parser.parse_args()
 
     resolutions = [int(x) for x in args.resolution.split(',')]
     print(f"Resolutions: {resolutions}")
 
-    # Load annotations
     with open(args.ann_file, 'r') as f:
         ann_data = json.load(f)
 
@@ -222,32 +199,103 @@ def main():
 
     print(f"Total entries: {len(entries)}")
 
-    # Shard
-    start = len(entries) * args.rank // args.world_size
-    end = len(entries) * (args.rank + 1) // args.world_size
-    entries = entries[start:end]
-    print(f"Rank {args.rank}/{args.world_size}: processing {len(entries)} entries")
+    # Load progress from ALL ranks
+    os.makedirs(args.log_root, exist_ok=True)
+    res_tag = args.resolution.replace(',', '_')
+    all_progress = {}
+    if res_tag == '512':
+        progress_files = [f for f in glob.glob(os.path.join(args.log_root, 'progress_*.json'))
+                          if os.path.basename(f).replace('progress_', '').replace('.json', '').isdigit()]
+    else:
+        progress_files = glob.glob(os.path.join(args.log_root, f'progress_{res_tag}_*.json'))
+    for p_path in progress_files:
+        try:
+            with open(p_path, 'r') as f:
+                all_progress.update(json.load(f))
+        except Exception as e:
+            print(f"[WARN] Failed to read {p_path}: {e}")
+    print(f"Loaded global progress: {len(all_progress)} completed objects from {len(progress_files)} files")
 
-    # Process
-    results = []
-    for entry in tqdm(entries, desc="Voxelizing PBR"):
+    # Filter out completed FIRST
+    to_process = []
+    for entry in entries:
         shard_id, obj_id = parse_entry(entry)
-        result = voxelize_one_object(
-            shard_id=shard_id,
-            obj_id=obj_id,
-            pbr_shared_root=args.pbr_shared_root,
-            rendered_root=args.rendered_root,
-            output_root=args.output_root,
-            resolutions=resolutions,
-        )
-        results.append(result)
+        obj_key = f"{shard_id}/{obj_id}"
+        if obj_key in all_progress and all_progress[obj_key].get('status') == 'success':
+            continue
+        to_process.append((shard_id, obj_id))
 
-    # Summary
+    print(f"To process (after filtering): {len(to_process)}")
+
+    # Sort by priority
+    if args.priority_list and os.path.exists(args.priority_list):
+        with open(args.priority_list, 'r') as f:
+            priority_ids = set(line.strip() for line in f if line.strip())
+        priority_objs = [(s, o) for s, o in to_process if o in priority_ids]
+        non_priority_objs = [(s, o) for s, o in to_process if o not in priority_ids]
+        to_process = priority_objs + non_priority_objs
+        print(f"Priority list: {len(priority_ids)} ids, {len(priority_objs)} matched in to_process")
+
+    # THEN shard
+    start = len(to_process) * args.rank // args.world_size
+    end = len(to_process) * (args.rank + 1) // args.world_size
+    to_process = to_process[start:end]
+    print(f"Rank {args.rank}/{args.world_size}: assigned {len(to_process)} entries")
+
+    # Per-rank progress
+    progress_path = os.path.join(args.log_root, f'progress_{args.rank}.json') if res_tag == '512' else os.path.join(args.log_root, f'progress_{res_tag}_{args.rank}.json')
+    progress = load_progress(progress_path)
+
+    if len(to_process) == 0:
+        print("Nothing to do.")
+        return
+
+    status_log_path = os.path.join(args.log_root, f'status_{args.rank}.log') if res_tag == '512' else os.path.join(args.log_root, f'status_{res_tag}_{args.rank}.log')
+    total_to_process = len(to_process)
+    completed_count = 0
+    start_time = time.time()
+
+    worker_fn = partial(
+        voxelize_pbr_one_object,
+        pbr_shared_root=args.pbr_shared_root,
+        rendered_root=args.rendered_root,
+        output_root=args.output_root,
+        resolutions=resolutions,
+    )
+
+    if args.max_workers <= 1:
+        for item in to_process:
+            result = worker_fn(item)
+            obj_key = f"{result['shard_id']}/{result['obj_id']}"
+            progress[obj_key] = result
+            save_progress(progress_path, progress)
+            completed_count += 1
+            elapsed = time.time() - start_time
+            avg = elapsed / completed_count
+            eta = avg * (total_to_process - completed_count)
+            with open(status_log_path, 'a') as f:
+                f.write(f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg:.1f}s/obj eta={eta:.0f}s\n")
+            print(f"[{completed_count}/{total_to_process}] {obj_key} {result['status']} avg={avg:.1f}s eta={eta:.0f}s")
+    else:
+        with Pool(processes=args.max_workers, maxtasksperchild=1) as pool:
+            results_iter = pool.imap_unordered(worker_fn, to_process)
+            for result in results_iter:
+                obj_key = f"{result['shard_id']}/{result['obj_id']}"
+                progress[obj_key] = result
+                save_progress(progress_path, progress)
+                completed_count += 1
+                elapsed = time.time() - start_time
+                avg = elapsed / completed_count
+                eta = avg * (total_to_process - completed_count)
+                with open(status_log_path, 'a') as f:
+                    f.write(f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg:.1f}s/obj eta={eta:.0f}s\n")
+                print(f"[{completed_count}/{total_to_process}] {obj_key} {result['status']} avg={avg:.1f}s eta={eta:.0f}s")
+
     statuses = {}
-    for r in results:
-        s = r['status']
+    for v in progress.values():
+        s = v.get('status', 'unknown')
         statuses[s] = statuses.get(s, 0) + 1
-    print(f"\nSummary: {statuses}")
+    print(f"\nFinal summary: {statuses}")
 
 
 if __name__ == '__main__':

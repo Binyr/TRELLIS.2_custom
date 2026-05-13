@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 不要修改远程的环境，如果环境有问题，请立刻停止并报告给我
 
-你的远程目录为`/local-ssd/actionmesh/`
+你的远程目录为`/local-ssd/xxx/`
 
 远程的环境，通过在远程仓库目录下，`source .venv/bin/activate`激活
 

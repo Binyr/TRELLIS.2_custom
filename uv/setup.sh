@@ -277,6 +277,7 @@ uv pip install objaverse
 
 ln -s /threed-code/yanruibin/trellis.2_data/
 ln -s /efs/yanruibin/projects/video_pixal3d_train/data
+# ln -s /threed-code/yanruibin/efs/4D_video_data_process/data2/ data
 # HF_TOKEN should be set in your environment (e.g. ~/.bashrc or secrets manager)
 # export HF_TOKEN=your_token_here
 
