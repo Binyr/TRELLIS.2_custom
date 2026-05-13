@@ -4,4 +4,5 @@ python data_toolkit/dual_grid_v2.py \
   --output_root data/trellis.2/dual_grid_4d \
   --resolution 512 \
   --max_workers 8 \
+  --priority_list claude_tmp/objv1_sketchfab_intersection.txt \
   --world_size ${1:-1} --rank ${2:-0}

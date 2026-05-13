@@ -66,6 +66,10 @@ def dual_grid_one_object(
         vertices_seq = mesh_data['vertices'].copy()  # (T, N, 3) float16
         faces = mesh_data['faces'].copy()             # (F, 3) int32
 
+    num_faces = faces.shape[0]
+    if num_faces > 500000:
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}
+
     num_frames = vertices_seq.shape[0]
     faces_t = torch.from_numpy(faces).long()
 
@@ -176,6 +180,8 @@ def main():
     parser.add_argument('--world_size', type=int, default=1)
     parser.add_argument('--max_workers', type=int, default=1,
                         help='Number of parallel processes')
+    parser.add_argument('--priority_list', type=str, default=None,
+                        help='Path to file with priority obj_ids (one per line), these will be processed first')
     args = parser.parse_args()
 
     resolutions = [int(x) for x in args.resolution.split(',')]
@@ -193,27 +199,54 @@ def main():
 
     print(f"Total entries: {len(entries)}")
 
-    # Shard
-    start = len(entries) * args.rank // args.world_size
-    end = len(entries) * (args.rank + 1) // args.world_size
-    entries = entries[start:end]
-    print(f"Rank {args.rank}/{args.world_size}: processing {len(entries)} entries")
-
-    # Load progress (keyed by resolution to allow separate runs)
+    # Load progress from ALL ranks to get global completion status
     os.makedirs(args.output_root, exist_ok=True)
     res_tag = args.resolution.replace(',', '_')
-    progress_path = os.path.join(args.output_root, f'progress_{args.rank}.json') if res_tag == '512' else os.path.join(args.output_root, f'progress_{res_tag}_{args.rank}.json')
-    progress = load_progress(progress_path)
-    print(f"Loaded progress ({progress_path}): {len(progress)} completed objects")
+    all_progress = {}
+    import glob
+    if res_tag == '512':
+        # Match progress_0.json, progress_1.json, ... but NOT progress_1024_0.json
+        progress_files = [f for f in glob.glob(os.path.join(args.output_root, 'progress_*.json'))
+                          if os.path.basename(f).replace('progress_', '').replace('.json', '').isdigit()]
+    else:
+        progress_files = glob.glob(os.path.join(args.output_root, f'progress_{res_tag}_*.json'))
+    for p_path in progress_files:
+        try:
+            with open(p_path, 'r') as f:
+                all_progress.update(json.load(f))
+        except Exception as e:
+            print(f"[WARN] Failed to read {p_path}: {e}")
+    print(f"Loaded global progress: {len(all_progress)} completed objects from {len(progress_files)} files")
 
-    # Filter out completed objects
+    # Filter out completed objects FIRST
     to_process = []
     for entry in entries:
         shard_id, obj_id = parse_entry(entry)
         obj_key = f"{shard_id}/{obj_id}"
-        if obj_key in progress and progress[obj_key].get('status') == 'success':
+        if obj_key in all_progress and all_progress[obj_key].get('status') == 'success':
             continue
         to_process.append((shard_id, obj_id))
+
+    print(f"To process (after filtering): {len(to_process)}")
+
+    # Sort by priority: priority_list obj_ids first
+    if args.priority_list and os.path.exists(args.priority_list):
+        with open(args.priority_list, 'r') as f:
+            priority_ids = set(line.strip() for line in f if line.strip())
+        priority_objs = [(s, o) for s, o in to_process if o in priority_ids]
+        non_priority_objs = [(s, o) for s, o in to_process if o not in priority_ids]
+        to_process = priority_objs + non_priority_objs
+        print(f"Priority list: {len(priority_ids)} ids, {len(priority_objs)} matched in to_process")
+
+    # THEN shard
+    start = len(to_process) * args.rank // args.world_size
+    end = len(to_process) * (args.rank + 1) // args.world_size
+    to_process = to_process[start:end]
+    print(f"Rank {args.rank}/{args.world_size}: assigned {len(to_process)} entries")
+
+    # Per-rank progress file for this run
+    progress_path = os.path.join(args.output_root, f'progress_{args.rank}.json') if res_tag == '512' else os.path.join(args.output_root, f'progress_{res_tag}_{args.rank}.json')
+    progress = load_progress(progress_path)
 
     print(f"To process (after filtering): {len(to_process)}")
 
