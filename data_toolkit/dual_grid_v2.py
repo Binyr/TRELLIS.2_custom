@@ -192,9 +192,13 @@ def dual_grid_one_view(
             with tarfile.open(local_tar_path, 'w') as tar:
                 for fi, fpath in sorted(frame_files):
                     tar.add(fpath, arcname=f'{fi:06d}.vxz')
+            t_tar = time.time() - t0
             # Single copy to S3
+            t0 = time.time()
             os.system(f'cp "{local_tar_path}" "{tar_path}"')
-            t_write += time.time() - t0
+            t_cp = time.time() - t0
+            t_write += t_tar + t_cp
+            print(f"[TIMING] tar={t_tar:.3f}s cp={t_cp:.3f}s")
 
         # Clean up local temp dir
         shutil.rmtree(local_view_dir, ignore_errors=True)
