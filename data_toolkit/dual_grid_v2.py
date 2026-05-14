@@ -6,8 +6,9 @@ Reads result_mesh.npz (vertices_seq + faces) and produces per-frame .vxz files
 via o_voxel.convert.mesh_to_flexible_dual_grid().
 
 Features:
-- Multi-process parallel processing (--max_workers)
+- Per-view scheduling granularity: each task = one (object, view) pair
 - View-level checkpoint-based resume via progress_{rank}.json
+- Multi-process parallel processing (--max_workers)
 - Distributed sharding (--rank / --world_size)
 
 Usage:
@@ -53,7 +54,7 @@ def parse_entry(entry: str):
 def load_camera_w2c_rotations(rendered_dir: str, view_start=0, view_stride=2):
     """
     Load camera w2c rotation matrices from result.json.
-    Returns list of (view_index, w2c_rot_np) tuples for selected views.
+    Returns dict of {view_index: w2c_rot_np} for selected views.
     """
     result_json_path = os.path.join(rendered_dir, 'result.json')
     if not os.path.exists(result_json_path):
@@ -61,53 +62,43 @@ def load_camera_w2c_rotations(rendered_dir: str, view_start=0, view_stride=2):
     with open(result_json_path, 'r') as f:
         data = json.load(f)
     cameras = data['_global']['static_cameras']
-    selected = []
+    view_dict = {}
     for cam in cameras:
         view_idx = cam['view_index']
         if view_idx % view_stride == view_start:
             c2w = np.array(cam['camera_c2w'], dtype=np.float32)
             w2c = np.linalg.inv(c2w)
             w2c_rot = w2c[:3, :3]
-            selected.append((view_idx, w2c_rot))
-    return selected
+            view_dict[view_idx] = w2c_rot
+    return view_dict
 
 
-def dual_grid_one_object(
+def dual_grid_one_view(
     shard_id: str,
     obj_id: str,
+    view_idx: int,
     rendered_root: str,
     output_root: str,
     resolutions: list,
-    skip_views: set = None,
     debug: bool = False,
 ):
     """
-    Convert all frames of one object to geometry O-Voxels at given resolutions, per camera view.
-    skip_views: set of view_idx (int) to skip (already completed per progress).
-    Returns a list of per-view result dicts.
+    Convert all frames of one object for ONE camera view to geometry O-Voxels.
+    Returns a single result dict.
     """
-    if skip_views is None:
-        skip_views = set()
 
     # Load mesh sequence
     rendered_dir = os.path.join(rendered_root, f'{shard_id}_static_camera_distance_v3', obj_id)
     mesh_npz_path = os.path.join(rendered_dir, 'result_mesh.npz')
     if not os.path.exists(mesh_npz_path):
-        return [{'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': -1, 'status': 'missing_mesh', 'num_frames': 0}]
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'missing_mesh', 'num_frames': 0}
 
-    # Load camera rotations
+    # Load camera rotation for this view
     camera_views = load_camera_w2c_rotations(rendered_dir)
-    if camera_views is None or len(camera_views) == 0:
-        return [{'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': -1, 'status': 'missing_cameras', 'num_frames': 0}]
+    if camera_views is None or view_idx not in camera_views:
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'missing_camera', 'num_frames': 0}
 
-    # Debug mode: only first view
-    if debug:
-        camera_views = camera_views[:1]
-
-    # Filter out already-completed views
-    camera_views = [(v, r) for v, r in camera_views if v not in skip_views]
-    if len(camera_views) == 0:
-        return [{'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': -1, 'status': 'all_views_skipped', 'num_frames': 0}]
+    w2c_rot = camera_views[view_idx]
 
     with np.load(mesh_npz_path) as mesh_data:
         vertices_seq = mesh_data['vertices'].copy()  # (T, N, 3) float16
@@ -115,78 +106,68 @@ def dual_grid_one_object(
 
     num_faces = faces.shape[0]
     if num_faces > 500000:
-        return [{'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': -1, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}]
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}
 
     num_frames = vertices_seq.shape[0]
     if debug:
         num_frames = min(num_frames, 1)
     faces_t = torch.from_numpy(faces).long()
 
-    view_results = []
+    view_status = 'success'
     for res in resolutions:
-        for view_idx, w2c_rot in camera_views:
-            output_dir = os.path.join(output_root, str(res), shard_id, obj_id, f'view_{view_idx:02d}')
-            os.makedirs(output_dir, exist_ok=True)
+        output_dir = os.path.join(output_root, str(res), shard_id, obj_id, f'view_{view_idx:02d}')
+        os.makedirs(output_dir, exist_ok=True)
 
-            view_status = 'success'
-            for frame_idx in range(num_frames):
-                output_path = os.path.join(output_dir, f'{frame_idx:06d}.vxz')
+        for frame_idx in range(num_frames):
+            output_path = os.path.join(output_dir, f'{frame_idx:06d}.vxz')
+            if os.path.exists(output_path):
+                continue
+
+            # Get frame vertices, rotate to camera space, then clamp
+            frame_verts = vertices_seq[frame_idx].astype(np.float32)
+            frame_verts = frame_verts @ w2c_rot.T  # world -> camera (rotation only)
+            frame_verts = np.clip(frame_verts, -0.5, 0.5)
+            verts_t = torch.from_numpy(frame_verts)
+
+            try:
+                voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
+                    vertices=verts_t,
+                    faces=faces_t,
+                    grid_size=res,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    face_weight=1.0,
+                    boundary_weight=0.2,
+                    regularization_weight=1e-2,
+                    timing=False,
+                )
+
+                dual_vertices = dual_vertices * res - voxel_indices
+                assert torch.all(dual_vertices >= -1e-3) and torch.all(dual_vertices <= 1 + 1e-3), \
+                    'dual_vertices out of range'
+                dual_vertices = torch.clamp(dual_vertices, 0, 1)
+                dual_vertices = (dual_vertices * 255).type(torch.uint8)
+                intersected = (intersected[:, 0:1] + 2 * intersected[:, 1:2] + 4 * intersected[:, 2:3]).type(torch.uint8)
+
+                o_voxel.io.write_vxz(
+                    output_path,
+                    voxel_indices,
+                    {'vertices': dual_vertices, 'intersected': intersected},
+                )
+            except Exception as e:
+                print(f"[ERROR] dual_grid failed: {shard_id}/{obj_id} view={view_idx} frame={frame_idx} res={res}: {e}")
                 if os.path.exists(output_path):
-                    continue
-
-                # Get frame vertices, rotate to camera space, then clamp
-                frame_verts = vertices_seq[frame_idx].astype(np.float32)
-                frame_verts = frame_verts @ w2c_rot.T  # world -> camera (rotation only)
-                frame_verts = np.clip(frame_verts, -0.5, 0.5)
-                verts_t = torch.from_numpy(frame_verts)
-
+                    os.remove(output_path)
+                view_status = 'error'
+                continue
+            finally:
+                del verts_t
                 try:
-                    voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
-                        vertices=verts_t,
-                        faces=faces_t,
-                        grid_size=res,
-                        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                        face_weight=1.0,
-                        boundary_weight=0.2,
-                        regularization_weight=1e-2,
-                        timing=False,
-                    )
-
-                    dual_vertices = dual_vertices * res - voxel_indices
-                    assert torch.all(dual_vertices >= -1e-3) and torch.all(dual_vertices <= 1 + 1e-3), \
-                        'dual_vertices out of range'
-                    dual_vertices = torch.clamp(dual_vertices, 0, 1)
-                    dual_vertices = (dual_vertices * 255).type(torch.uint8)
-                    intersected = (intersected[:, 0:1] + 2 * intersected[:, 1:2] + 4 * intersected[:, 2:3]).type(torch.uint8)
-
-                    o_voxel.io.write_vxz(
-                        output_path,
-                        voxel_indices,
-                        {'vertices': dual_vertices, 'intersected': intersected},
-                    )
-                except Exception as e:
-                    print(f"[ERROR] dual_grid failed: {shard_id}/{obj_id} view={view_idx} frame={frame_idx} res={res}: {e}")
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                    view_status = 'error'
-                    continue
-                finally:
-                    del verts_t
-                    try:
-                        del voxel_indices, dual_vertices, intersected
-                    except NameError:
-                        pass
-
-            view_results.append({
-                'shard_id': shard_id,
-                'obj_id': obj_id,
-                'view_idx': view_idx,
-                'status': view_status,
-                'num_frames': num_frames,
-            })
+                    del voxel_indices, dual_vertices, intersected
+                except NameError:
+                    pass
 
     del vertices_seq, faces, faces_t
-    return view_results
+    return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': view_status, 'num_frames': num_frames}
 
 
 def load_progress(progress_path: str) -> dict:
@@ -215,28 +196,22 @@ def append_status_log(status_log_path: str, line: str):
         f.write(existing + line + '\n')
 
 
-def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, all_progress, debug=False):
-    """Wrapper for Pool.imap_unordered: unpacks tuple, computes skip_views, calls dual_grid_one_object."""
-    shard_id, obj_id = args_tuple
-    # Determine which views to skip based on progress
-    skip_views = set()
-    for v in EXPECTED_VIEWS:
-        view_key = f"{shard_id}/{obj_id}/view_{v:02d}"
-        if view_key in all_progress and all_progress[view_key].get('status') == 'success':
-            skip_views.add(v)
+def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, debug=False):
+    """Wrapper for Pool.imap_unordered: processes one (shard_id, obj_id, view_idx) task."""
+    shard_id, obj_id, view_idx = args_tuple
     try:
-        return dual_grid_one_object(
+        return dual_grid_one_view(
             shard_id=shard_id,
             obj_id=obj_id,
+            view_idx=view_idx,
             rendered_root=rendered_root,
             output_root=output_root,
             resolutions=resolutions,
-            skip_views=skip_views,
             debug=debug,
         )
     except Exception as e:
-        print(f"[ERROR] {shard_id}/{obj_id}: {e}")
-        return [{'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': -1, 'status': 'error', 'error': str(e)}]
+        print(f"[ERROR] {shard_id}/{obj_id}/view_{view_idx:02d}: {e}")
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'error', 'error': str(e)}
 
 
 def main():
@@ -279,7 +254,7 @@ def main():
     if args.split in ('test', 'all'):
         entries.extend(ann_data.get('test', []))
 
-    print(f"Total entries: {len(entries)}")
+    print(f"Total entries (objects): {len(entries)}")
 
     # Log directory: output_root/log_{resolution}/
     res_tag = args.resolution.replace(',', '_')
@@ -299,41 +274,37 @@ def main():
             print(f"[WARN] Failed to read {p_path}: {e}")
     print(f"Loaded global progress: {len(all_progress)} completed views from {len(progress_files)} files")
 
-    # Filter out objects where ALL views are completed
-    to_process = []
-    skipped_objs = 0
+    # Build per-view task list, filtering out completed views
+    views_to_use = EXPECTED_VIEWS if not args.debug else EXPECTED_VIEWS[:1]
+    to_process = []  # list of (shard_id, obj_id, view_idx)
+    skipped_views = 0
     for entry in entries:
         shard_id, obj_id = parse_entry(entry)
-        # Check if all views are done
-        all_views_done = True
-        for v in EXPECTED_VIEWS:
+        for v in views_to_use:
             view_key = f"{shard_id}/{obj_id}/view_{v:02d}"
-            if view_key not in all_progress or all_progress[view_key].get('status') != 'success':
-                all_views_done = False
-                break
-        if all_views_done:
-            skipped_objs += 1
-            continue
-        to_process.append((shard_id, obj_id))
+            if view_key in all_progress and all_progress[view_key].get('status') == 'success':
+                skipped_views += 1
+                continue
+            to_process.append((shard_id, obj_id, v))
 
-    print(f"To process (after filtering): {len(to_process)} objects ({skipped_objs} fully completed)")
+    print(f"To process: {len(to_process)} views ({skipped_views} already completed)")
 
     # Sort by priority: priority_list obj_ids first
     if args.priority_list and os.path.exists(args.priority_list):
         with open(args.priority_list, 'r') as f:
             priority_ids = set(line.strip() for line in f if line.strip())
-        priority_objs = [(s, o) for s, o in to_process if o in priority_ids]
-        non_priority_objs = [(s, o) for s, o in to_process if o not in priority_ids]
-        to_process = priority_objs + non_priority_objs
-        print(f"Priority list: {len(priority_ids)} ids, {len(priority_objs)} matched in to_process")
+        priority_views = [(s, o, v) for s, o, v in to_process if o in priority_ids]
+        non_priority_views = [(s, o, v) for s, o, v in to_process if o not in priority_ids]
+        to_process = priority_views + non_priority_views
+        print(f"Priority list: {len(priority_ids)} ids, {len(priority_views)} views matched")
 
     # THEN shard
     start = len(to_process) * args.rank // args.world_size
     end = len(to_process) * (args.rank + 1) // args.world_size
     to_process = to_process[start:end]
-    print(f"Rank {args.rank}/{args.world_size}: assigned {len(to_process)} entries")
+    print(f"Rank {args.rank}/{args.world_size}: assigned {len(to_process)} views")
 
-    # Per-rank progress file for this run
+    # Per-rank progress file
     progress_path = os.path.join(log_dir, f'progress_{args.rank}.json')
     progress = load_progress(progress_path)
 
@@ -344,41 +315,29 @@ def main():
     status_log_path = os.path.join(log_dir, f'status_{args.rank}.log')
     total_to_process = len(to_process)
     completed_count = 0
-    completed_views = 0
     start_time = time.time()
 
     # Process
     if args.max_workers <= 1:
         # Single process
-        for shard_id, obj_id in tqdm(to_process, desc="Dual grid 4D"):
-            # Compute skip_views for this object
-            skip_views = set()
-            for v in EXPECTED_VIEWS:
-                view_key = f"{shard_id}/{obj_id}/view_{v:02d}"
-                if view_key in all_progress and all_progress[view_key].get('status') == 'success':
-                    skip_views.add(v)
-
-            view_results = dual_grid_one_object(
+        for shard_id, obj_id, view_idx in tqdm(to_process, desc="Dual grid 4D"):
+            result = dual_grid_one_view(
                 shard_id=shard_id,
                 obj_id=obj_id,
+                view_idx=view_idx,
                 rendered_root=args.rendered_root,
                 output_root=args.output_root,
                 resolutions=resolutions,
-                skip_views=skip_views,
                 debug=args.debug,
             )
-            for vr in view_results:
-                view_key = f"{vr['shard_id']}/{vr['obj_id']}/view_{vr['view_idx']:02d}" if vr['view_idx'] >= 0 else f"{vr['shard_id']}/{vr['obj_id']}/error"
-                progress[view_key] = vr
-                all_progress[view_key] = vr
-                completed_views += 1
-                append_status_log(status_log_path, f"{view_key} {vr['status']} frames={vr.get('num_frames', 0)}")
+            view_key = f"{shard_id}/{obj_id}/view_{view_idx:02d}"
+            progress[view_key] = result
             save_progress(progress_path, progress)
             completed_count += 1
             elapsed = time.time() - start_time
-            avg_per_obj = elapsed / completed_count
-            eta = avg_per_obj * (total_to_process - completed_count)
-            print(f"[{completed_count}/{total_to_process}] {shard_id}/{obj_id} {len(view_results)}views avg={avg_per_obj:.1f}s eta={eta:.0f}s")
+            avg_per_view = elapsed / completed_count
+            eta = avg_per_view * (total_to_process - completed_count)
+            append_status_log(status_log_path, f"{view_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg_per_view:.1f}s/view eta={eta:.0f}s")
     else:
         # Multi-process with worker recycling to prevent memory leaks
         worker_fn = partial(
@@ -386,26 +345,21 @@ def main():
             rendered_root=args.rendered_root,
             output_root=args.output_root,
             resolutions=resolutions,
-            all_progress=all_progress,
             debug=args.debug,
         )
         with Pool(processes=args.max_workers, maxtasksperchild=1) as pool:
             results_iter = pool.imap_unordered(worker_fn, to_process)
-            with tqdm(total=len(to_process), desc="Dual grid 4D") as pbar:
-                for view_results in results_iter:
-                    shard_id = view_results[0]['shard_id']
-                    obj_id = view_results[0]['obj_id']
-                    for vr in view_results:
-                        view_key = f"{vr['shard_id']}/{vr['obj_id']}/view_{vr['view_idx']:02d}" if vr['view_idx'] >= 0 else f"{vr['shard_id']}/{vr['obj_id']}/error"
-                        progress[view_key] = vr
-                        completed_views += 1
-                        append_status_log(status_log_path, f"{view_key} {vr['status']} frames={vr.get('num_frames', 0)}")
+            with tqdm(total=total_to_process, desc="Dual grid 4D") as pbar:
+                for result in results_iter:
+                    view_key = f"{result['shard_id']}/{result['obj_id']}/view_{result['view_idx']:02d}"
+                    progress[view_key] = result
                     save_progress(progress_path, progress)
                     completed_count += 1
                     elapsed = time.time() - start_time
-                    avg_per_obj = elapsed / completed_count
-                    eta = avg_per_obj * (total_to_process - completed_count)
-                    pbar.set_postfix_str(f"views={completed_views} avg={avg_per_obj:.1f}s eta={eta:.0f}s")
+                    avg_per_view = elapsed / completed_count
+                    eta = avg_per_view * (total_to_process - completed_count)
+                    append_status_log(status_log_path, f"{view_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg_per_view:.1f}s/view eta={eta:.0f}s")
+                    pbar.set_postfix_str(f"avg={avg_per_view:.1f}s/view eta={eta:.0f}s")
                     pbar.update(1)
 
     # Summary
