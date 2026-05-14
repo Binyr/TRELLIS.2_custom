@@ -78,12 +78,16 @@ def dual_grid_one_object(
     rendered_root: str,
     output_root: str,
     resolutions: list,
+    skip_views: set = None,
     debug: bool = False,
 ):
     """
     Convert all frames of one object to geometry O-Voxels at given resolutions, per camera view.
+    skip_views: set of view_idx (int) to skip (already completed per progress).
     Returns a list of per-view result dicts.
     """
+    if skip_views is None:
+        skip_views = set()
 
     # Load mesh sequence
     rendered_dir = os.path.join(rendered_root, f'{shard_id}_static_camera_distance_v3', obj_id)
@@ -96,9 +100,14 @@ def dual_grid_one_object(
     if camera_views is None or len(camera_views) == 0:
         return [{'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': -1, 'status': 'missing_cameras', 'num_frames': 0}]
 
-    # Debug mode: only first view, first frame
+    # Debug mode: only first view
     if debug:
         camera_views = camera_views[:1]
+
+    # Filter out already-completed views
+    camera_views = [(v, r) for v, r in camera_views if v not in skip_views]
+    if len(camera_views) == 0:
+        return [{'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': -1, 'status': 'all_views_skipped', 'num_frames': 0}]
 
     with np.load(mesh_npz_path) as mesh_data:
         vertices_seq = mesh_data['vertices'].copy()  # (T, N, 3) float16
@@ -118,21 +127,6 @@ def dual_grid_one_object(
         for view_idx, w2c_rot in camera_views:
             output_dir = os.path.join(output_root, str(res), shard_id, obj_id, f'view_{view_idx:02d}')
             os.makedirs(output_dir, exist_ok=True)
-
-            # Quick check: skip view if all frames already exist
-            all_exist = all(
-                os.path.exists(os.path.join(output_dir, f'{fi:06d}.vxz'))
-                for fi in range(num_frames)
-            )
-            if all_exist:
-                view_results.append({
-                    'shard_id': shard_id,
-                    'obj_id': obj_id,
-                    'view_idx': view_idx,
-                    'status': 'success',
-                    'num_frames': num_frames,
-                })
-                continue
 
             view_status = 'success'
             for frame_idx in range(num_frames):
@@ -221,9 +215,15 @@ def append_status_log(status_log_path: str, line: str):
         f.write(existing + line + '\n')
 
 
-def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, debug=False):
-    """Wrapper for Pool.imap_unordered: unpacks tuple and calls dual_grid_one_object."""
+def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, all_progress, debug=False):
+    """Wrapper for Pool.imap_unordered: unpacks tuple, computes skip_views, calls dual_grid_one_object."""
     shard_id, obj_id = args_tuple
+    # Determine which views to skip based on progress
+    skip_views = set()
+    for v in EXPECTED_VIEWS:
+        view_key = f"{shard_id}/{obj_id}/view_{v:02d}"
+        if view_key in all_progress and all_progress[view_key].get('status') == 'success':
+            skip_views.add(v)
     try:
         return dual_grid_one_object(
             shard_id=shard_id,
@@ -231,6 +231,7 @@ def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, debug=F
             rendered_root=rendered_root,
             output_root=output_root,
             resolutions=resolutions,
+            skip_views=skip_views,
             debug=debug,
         )
     except Exception as e:
@@ -299,7 +300,6 @@ def main():
     print(f"Loaded global progress: {len(all_progress)} completed views from {len(progress_files)} files")
 
     # Filter out objects where ALL views are completed
-    expected_view_keys_per_obj = len(EXPECTED_VIEWS)  # 8 views
     to_process = []
     skipped_objs = 0
     for entry in entries:
@@ -351,25 +351,34 @@ def main():
     if args.max_workers <= 1:
         # Single process
         for shard_id, obj_id in tqdm(to_process, desc="Dual grid 4D"):
+            # Compute skip_views for this object
+            skip_views = set()
+            for v in EXPECTED_VIEWS:
+                view_key = f"{shard_id}/{obj_id}/view_{v:02d}"
+                if view_key in all_progress and all_progress[view_key].get('status') == 'success':
+                    skip_views.add(v)
+
             view_results = dual_grid_one_object(
                 shard_id=shard_id,
                 obj_id=obj_id,
                 rendered_root=args.rendered_root,
                 output_root=args.output_root,
                 resolutions=resolutions,
+                skip_views=skip_views,
                 debug=args.debug,
             )
             for vr in view_results:
                 view_key = f"{vr['shard_id']}/{vr['obj_id']}/view_{vr['view_idx']:02d}" if vr['view_idx'] >= 0 else f"{vr['shard_id']}/{vr['obj_id']}/error"
                 progress[view_key] = vr
+                all_progress[view_key] = vr
                 completed_views += 1
+                append_status_log(status_log_path, f"{view_key} {vr['status']} frames={vr.get('num_frames', 0)}")
             save_progress(progress_path, progress)
             completed_count += 1
             elapsed = time.time() - start_time
             avg_per_obj = elapsed / completed_count
             eta = avg_per_obj * (total_to_process - completed_count)
-            status = view_results[0]['status'] if len(view_results) == 1 and view_results[0]['view_idx'] < 0 else f"{len(view_results)}views_done"
-            append_status_log(status_log_path, f"{shard_id}/{obj_id} {status} done={completed_count}/{total_to_process} views={completed_views} avg={avg_per_obj:.1f}s/obj eta={eta:.0f}s")
+            print(f"[{completed_count}/{total_to_process}] {shard_id}/{obj_id} {len(view_results)}views avg={avg_per_obj:.1f}s eta={eta:.0f}s")
     else:
         # Multi-process with worker recycling to prevent memory leaks
         worker_fn = partial(
@@ -377,6 +386,7 @@ def main():
             rendered_root=args.rendered_root,
             output_root=args.output_root,
             resolutions=resolutions,
+            all_progress=all_progress,
             debug=args.debug,
         )
         with Pool(processes=args.max_workers, maxtasksperchild=1) as pool:
@@ -389,13 +399,13 @@ def main():
                         view_key = f"{vr['shard_id']}/{vr['obj_id']}/view_{vr['view_idx']:02d}" if vr['view_idx'] >= 0 else f"{vr['shard_id']}/{vr['obj_id']}/error"
                         progress[view_key] = vr
                         completed_views += 1
+                        append_status_log(status_log_path, f"{view_key} {vr['status']} frames={vr.get('num_frames', 0)}")
                     save_progress(progress_path, progress)
                     completed_count += 1
                     elapsed = time.time() - start_time
                     avg_per_obj = elapsed / completed_count
                     eta = avg_per_obj * (total_to_process - completed_count)
-                    status = view_results[0]['status'] if len(view_results) == 1 and view_results[0]['view_idx'] < 0 else f"{len(view_results)}views_done"
-                    append_status_log(status_log_path, f"{shard_id}/{obj_id} {status} done={completed_count}/{total_to_process} views={completed_views} avg={avg_per_obj:.1f}s/obj eta={eta:.0f}s")
+                    pbar.set_postfix_str(f"views={completed_views} avg={avg_per_obj:.1f}s eta={eta:.0f}s")
                     pbar.update(1)
 
     # Summary
