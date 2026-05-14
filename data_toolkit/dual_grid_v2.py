@@ -25,7 +25,6 @@ import argparse
 import io
 import json
 import os
-import shutil
 import tarfile
 import tempfile
 import time
@@ -199,7 +198,7 @@ def dual_grid_one_view(
                         info.size = len(data)
                         tar.addfile(info, io.BytesIO(data))
             # Single copy to S3
-            shutil.copy2(local_tar_path, tar_path)
+            os.system(f'cp "{local_tar_path}" "{tar_path}"')
             os.remove(local_tar_path)
             t_write += time.time() - t0
             del frame_buffers
