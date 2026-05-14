@@ -75,6 +75,7 @@ def dual_grid_one_object(
     rendered_root: str,
     output_root: str,
     resolutions: list,
+    debug: bool = False,
 ):
     """Convert all frames of one object to geometry O-Voxels at given resolutions, per camera view."""
 
@@ -89,6 +90,10 @@ def dual_grid_one_object(
     if camera_views is None or len(camera_views) == 0:
         return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'missing_cameras', 'num_frames': 0}
 
+    # Debug mode: only first view, first frame
+    if debug:
+        camera_views = camera_views[:1]
+
     with np.load(mesh_npz_path) as mesh_data:
         vertices_seq = mesh_data['vertices'].copy()  # (T, N, 3) float16
         faces = mesh_data['faces'].copy()             # (F, 3) int32
@@ -98,6 +103,8 @@ def dual_grid_one_object(
         return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}
 
     num_frames = vertices_seq.shape[0]
+    if debug:
+        num_frames = min(num_frames, 1)
     faces_t = torch.from_numpy(faces).long()
 
     for res in resolutions:
@@ -182,7 +189,7 @@ def append_status_log(status_log_path: str, line: str):
         f.write(existing + line + '\n')
 
 
-def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions):
+def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, debug=False):
     """Wrapper for Pool.imap_unordered: unpacks tuple and calls dual_grid_one_object."""
     shard_id, obj_id = args_tuple
     try:
@@ -192,6 +199,7 @@ def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions):
             rendered_root=rendered_root,
             output_root=output_root,
             resolutions=resolutions,
+            debug=debug,
         )
     except Exception as e:
         print(f"[ERROR] {shard_id}/{obj_id}: {e}")
@@ -219,10 +227,14 @@ def main():
                         help='Number of parallel processes')
     parser.add_argument('--priority_list', type=str, default=None,
                         help='Path to file with priority obj_ids (one per line), these will be processed first')
+    parser.add_argument('--debug', action='store_true',
+                        help='Debug mode: only process 1 view and 1 frame per object')
     args = parser.parse_args()
 
     resolutions = [int(x) for x in args.resolution.split(',')]
     print(f"Resolutions: {resolutions}")
+    if args.debug:
+        print("[DEBUG MODE] Only 1 view and 1 frame per object")
 
     # Load annotations
     with open(args.ann_file, 'r') as f:
@@ -236,17 +248,16 @@ def main():
 
     print(f"Total entries: {len(entries)}")
 
-    # Load progress from ALL ranks to get global completion status
-    os.makedirs(args.output_root, exist_ok=True)
+    # Log directory: output_root/log_{resolution}/
     res_tag = args.resolution.replace(',', '_')
+    log_dir = os.path.join(args.output_root, f'log_{res_tag}')
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(args.output_root, exist_ok=True)
+
+    # Load progress from ALL ranks to get global completion status
     all_progress = {}
     import glob
-    if res_tag == '512':
-        # Match progress_0.json, progress_1.json, ... but NOT progress_1024_0.json
-        progress_files = [f for f in glob.glob(os.path.join(args.output_root, 'progress_*.json'))
-                          if os.path.basename(f).replace('progress_', '').replace('.json', '').isdigit()]
-    else:
-        progress_files = glob.glob(os.path.join(args.output_root, f'progress_{res_tag}_*.json'))
+    progress_files = glob.glob(os.path.join(log_dir, 'progress_*.json'))
     for p_path in progress_files:
         try:
             with open(p_path, 'r') as f:
@@ -282,7 +293,7 @@ def main():
     print(f"Rank {args.rank}/{args.world_size}: assigned {len(to_process)} entries")
 
     # Per-rank progress file for this run
-    progress_path = os.path.join(args.output_root, f'progress_{args.rank}.json') if res_tag == '512' else os.path.join(args.output_root, f'progress_{res_tag}_{args.rank}.json')
+    progress_path = os.path.join(log_dir, f'progress_{args.rank}.json')
     progress = load_progress(progress_path)
 
     print(f"To process (after filtering): {len(to_process)}")
@@ -291,7 +302,7 @@ def main():
         print("Nothing to do.")
         return
 
-    status_log_path = os.path.join(args.output_root, f'status_{args.rank}.log') if res_tag == '512' else os.path.join(args.output_root, f'status_{res_tag}_{args.rank}.log')
+    status_log_path = os.path.join(log_dir, f'status_{args.rank}.log')
     total_to_process = len(to_process)
     completed_count = 0
     start_time = time.time()
@@ -306,6 +317,7 @@ def main():
                 rendered_root=args.rendered_root,
                 output_root=args.output_root,
                 resolutions=resolutions,
+                debug=args.debug,
             )
             obj_key = f"{shard_id}/{obj_id}"
             progress[obj_key] = result
@@ -322,6 +334,7 @@ def main():
             rendered_root=args.rendered_root,
             output_root=args.output_root,
             resolutions=resolutions,
+            debug=args.debug,
         )
         with Pool(processes=args.max_workers, maxtasksperchild=1) as pool:
             results_iter = pool.imap_unordered(worker_fn, to_process)
