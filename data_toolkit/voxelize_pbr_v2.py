@@ -61,6 +61,19 @@ def save_progress(progress_path: str, progress: dict):
         json.dump(progress, f)
 
 
+def append_status_log(status_log_path: str, line: str):
+    """Append a line to status log. Uses read+write instead of 'a' mode for S3 compatibility."""
+    existing = ''
+    if os.path.exists(status_log_path):
+        try:
+            with open(status_log_path, 'r') as f:
+                existing = f.read()
+        except Exception:
+            pass
+    with open(status_log_path, 'w') as f:
+        f.write(existing + line + '\n')
+
+
 def compute_face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     """Compute per-face normals, expanded to (F, 3, 3) for o_voxel compatibility."""
     v0 = vertices[faces[:, 0]]
@@ -271,8 +284,7 @@ def main():
             elapsed = time.time() - start_time
             avg = elapsed / completed_count
             eta = avg * (total_to_process - completed_count)
-            with open(status_log_path, 'a') as f:
-                f.write(f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg:.1f}s/obj eta={eta:.0f}s\n")
+            append_status_log(status_log_path, f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg:.1f}s/obj eta={eta:.0f}s")
             print(f"[{completed_count}/{total_to_process}] {obj_key} {result['status']} avg={avg:.1f}s eta={eta:.0f}s")
     else:
         with Pool(processes=args.max_workers, maxtasksperchild=1) as pool:
@@ -285,8 +297,7 @@ def main():
                 elapsed = time.time() - start_time
                 avg = elapsed / completed_count
                 eta = avg * (total_to_process - completed_count)
-                with open(status_log_path, 'a') as f:
-                    f.write(f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg:.1f}s/obj eta={eta:.0f}s\n")
+                append_status_log(status_log_path, f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg:.1f}s/obj eta={eta:.0f}s")
                 print(f"[{completed_count}/{total_to_process}] {obj_key} {result['status']} avg={avg:.1f}s eta={eta:.0f}s")
 
     statuses = {}

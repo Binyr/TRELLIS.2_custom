@@ -307,8 +307,7 @@ def main():
                     elapsed = time.time() - start_time
                     avg_per_obj = elapsed / completed_count
                     eta = avg_per_obj * (total_to_process - completed_count)
-                    with open(status_log_path, 'a') as f:
-                        f.write(f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg_per_obj:.1f}s/obj eta={eta:.0f}s\n")
+                    append_status_log(status_log_path, f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg_per_obj:.1f}s/obj eta={eta:.0f}s")
                     pbar.update(1)
 
     # Summary
