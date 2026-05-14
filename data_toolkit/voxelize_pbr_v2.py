@@ -85,6 +85,28 @@ def compute_face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return np.stack([fn, fn, fn], axis=1).astype(np.float32)
 
 
+def load_camera_w2c_rotations(rendered_dir: str, view_start=0, view_stride=2):
+    """
+    Load camera w2c rotation matrices from result.json.
+    Returns list of (view_index, w2c_rot_np) tuples for selected views.
+    """
+    result_json_path = os.path.join(rendered_dir, 'result.json')
+    if not os.path.exists(result_json_path):
+        return None
+    with open(result_json_path, 'r') as f:
+        data = json.load(f)
+    cameras = data['_global']['static_cameras']
+    selected = []
+    for cam in cameras:
+        view_idx = cam['view_index']
+        if view_idx % view_stride == view_start:
+            c2w = np.array(cam['camera_c2w'], dtype=np.float32)
+            w2c = np.linalg.inv(c2w)
+            w2c_rot = w2c[:3, :3]
+            selected.append((view_idx, w2c_rot))
+    return selected
+
+
 def voxelize_pbr_one_object(
     args_tuple,
     pbr_shared_root,
@@ -92,7 +114,7 @@ def voxelize_pbr_one_object(
     output_root,
     resolutions,
 ):
-    """Worker function: voxelize all frames of one object."""
+    """Worker function: voxelize all frames of one object, per camera view."""
     shard_id, obj_id = args_tuple
 
     # Load pbr shared data
@@ -108,6 +130,11 @@ def voxelize_pbr_one_object(
     mesh_npz_path = os.path.join(rendered_dir, 'result_mesh.npz')
     if not os.path.exists(mesh_npz_path):
         return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'missing_mesh', 'num_frames': 0}
+
+    # Load camera rotations
+    camera_views = load_camera_w2c_rotations(rendered_dir)
+    if camera_views is None or len(camera_views) == 0:
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'missing_cameras', 'num_frames': 0}
 
     with np.load(mesh_npz_path) as mesh_data:
         vertices_seq = mesh_data['vertices'].copy()
@@ -126,57 +153,61 @@ def voxelize_pbr_one_object(
     num_frames = vertices_seq.shape[0]
 
     for res in resolutions:
-        output_dir = os.path.join(output_root, str(res), shard_id, obj_id)
-        os.makedirs(output_dir, exist_ok=True)
+        for view_idx, w2c_rot in camera_views:
+            output_dir = os.path.join(output_root, str(res), shard_id, obj_id, f'view_{view_idx:02d}')
+            os.makedirs(output_dir, exist_ok=True)
 
-        for frame_idx in range(num_frames):
-            output_path = os.path.join(output_dir, f'{frame_idx:06d}.vxz')
-            if os.path.exists(output_path):
-                continue
-
-            frame_verts = np.clip(vertices_seq[frame_idx].astype(np.float32), -0.5, 0.5)
-            normals = compute_face_normals(frame_verts, pbr_faces)
-
-            # Build dump
-            dump = copy.deepcopy(pbr_shared)
-            for mat in dump['materials']:
-                if mat.get('alphaTexture') is not None and mat['alphaMode'] == 'OPAQUE':
-                    mat['alphaMode'] = 'BLEND'
-            dump['materials'].append({
-                'baseColorFactor': [0.8, 0.8, 0.8], 'alphaFactor': 1.0,
-                'metallicFactor': 0.0, 'roughnessFactor': 0.5,
-                'alphaMode': 'OPAQUE', 'alphaCutoff': 0.5,
-                'baseColorTexture': None, 'alphaTexture': None,
-                'metallicTexture': None, 'roughnessTexture': None,
-            })
-            obj_data = dump['objects'][0]
-            obj_data['vertices'] = frame_verts
-            obj_data['normals'] = normals
-            obj_data['mat_ids'] = obj_data['mat_ids'].copy()
-            obj_data['mat_ids'][obj_data['mat_ids'] == -1] = len(dump['materials']) - 1
-
-            try:
-                coord, attr = o_voxel.convert.blender_dump_to_volumetric_attr(
-                    dump, grid_size=res,
-                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                    mip_level_offset=0, verbose=False, timing=False,
-                )
-                del attr['normal']
-                del attr['emissive']
-                o_voxel.io.write_vxz(output_path, coord, attr)
-            except Exception as e:
-                print(f"[ERROR] voxelize_pbr failed: {shard_id}/{obj_id} frame={frame_idx} res={res}: {e}")
+            for frame_idx in range(num_frames):
+                output_path = os.path.join(output_dir, f'{frame_idx:06d}.vxz')
                 if os.path.exists(output_path):
-                    os.remove(output_path)
-                continue
-            finally:
+                    continue
+
+                # Rotate to camera space, then clamp
+                frame_verts = vertices_seq[frame_idx].astype(np.float32)
+                frame_verts = frame_verts @ w2c_rot.T
+                frame_verts = np.clip(frame_verts, -0.5, 0.5)
+                normals = compute_face_normals(frame_verts, pbr_faces)
+
+                # Build dump
+                dump = copy.deepcopy(pbr_shared)
+                for mat in dump['materials']:
+                    if mat.get('alphaTexture') is not None and mat['alphaMode'] == 'OPAQUE':
+                        mat['alphaMode'] = 'BLEND'
+                dump['materials'].append({
+                    'baseColorFactor': [0.8, 0.8, 0.8], 'alphaFactor': 1.0,
+                    'metallicFactor': 0.0, 'roughnessFactor': 0.5,
+                    'alphaMode': 'OPAQUE', 'alphaCutoff': 0.5,
+                    'baseColorTexture': None, 'alphaTexture': None,
+                    'metallicTexture': None, 'roughnessTexture': None,
+                })
+                obj_data = dump['objects'][0]
+                obj_data['vertices'] = frame_verts
+                obj_data['normals'] = normals
+                obj_data['mat_ids'] = obj_data['mat_ids'].copy()
+                obj_data['mat_ids'][obj_data['mat_ids'] == -1] = len(dump['materials']) - 1
+
                 try:
-                    del coord, attr, dump, normals
-                except NameError:
-                    pass
+                    coord, attr = o_voxel.convert.blender_dump_to_volumetric_attr(
+                        dump, grid_size=res,
+                        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                        mip_level_offset=0, verbose=False, timing=False,
+                    )
+                    del attr['normal']
+                    del attr['emissive']
+                    o_voxel.io.write_vxz(output_path, coord, attr)
+                except Exception as e:
+                    print(f"[ERROR] voxelize_pbr failed: {shard_id}/{obj_id} view={view_idx} frame={frame_idx} res={res}: {e}")
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    continue
+                finally:
+                    try:
+                        del coord, attr, dump, normals
+                    except NameError:
+                        pass
 
     del vertices_seq, mesh_faces, pbr_shared
-    return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'success', 'num_frames': num_frames}
+    return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'success', 'num_frames': num_frames, 'num_views': len(camera_views)}
 
 
 def main():

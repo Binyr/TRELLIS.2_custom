@@ -47,6 +47,28 @@ def parse_entry(entry: str):
     return shard_id, obj_id
 
 
+def load_camera_w2c_rotations(rendered_dir: str, view_start=0, view_stride=2):
+    """
+    Load camera w2c rotation matrices from result.json.
+    Returns list of (view_index, w2c_rot_np) tuples for selected views.
+    """
+    result_json_path = os.path.join(rendered_dir, 'result.json')
+    if not os.path.exists(result_json_path):
+        return None
+    with open(result_json_path, 'r') as f:
+        data = json.load(f)
+    cameras = data['_global']['static_cameras']
+    selected = []
+    for cam in cameras:
+        view_idx = cam['view_index']
+        if view_idx % view_stride == view_start:
+            c2w = np.array(cam['camera_c2w'], dtype=np.float32)
+            w2c = np.linalg.inv(c2w)
+            w2c_rot = w2c[:3, :3]
+            selected.append((view_idx, w2c_rot))
+    return selected
+
+
 def dual_grid_one_object(
     shard_id: str,
     obj_id: str,
@@ -54,7 +76,7 @@ def dual_grid_one_object(
     output_root: str,
     resolutions: list,
 ):
-    """Convert all frames of one object to geometry O-Voxels at given resolutions."""
+    """Convert all frames of one object to geometry O-Voxels at given resolutions, per camera view."""
 
     # Load mesh sequence
     rendered_dir = os.path.join(rendered_root, f'{shard_id}_static_camera_distance_v3', obj_id)
@@ -62,71 +84,76 @@ def dual_grid_one_object(
     if not os.path.exists(mesh_npz_path):
         return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'missing_mesh', 'num_frames': 0}
 
+    # Load camera rotations
+    camera_views = load_camera_w2c_rotations(rendered_dir)
+    if camera_views is None or len(camera_views) == 0:
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'missing_cameras', 'num_frames': 0}
+
     with np.load(mesh_npz_path) as mesh_data:
         vertices_seq = mesh_data['vertices'].copy()  # (T, N, 3) float16
         faces = mesh_data['faces'].copy()             # (F, 3) int32
 
     num_faces = faces.shape[0]
-    # if num_faces > 500000:
-    #     return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}
+    if num_faces > 500000:
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}
 
     num_frames = vertices_seq.shape[0]
     faces_t = torch.from_numpy(faces).long()
 
     for res in resolutions:
-        output_dir = os.path.join(output_root, str(res), shard_id, obj_id)
-        os.makedirs(output_dir, exist_ok=True)
+        for view_idx, w2c_rot in camera_views:
+            output_dir = os.path.join(output_root, str(res), shard_id, obj_id, f'view_{view_idx:02d}')
+            os.makedirs(output_dir, exist_ok=True)
 
-        for frame_idx in range(num_frames):
-            output_path = os.path.join(output_dir, f'{frame_idx:06d}.vxz')
-            # Skip already processed frames (for partially completed objs)
-            if os.path.exists(output_path):
-                continue
-
-            # Get frame vertices, clamp to [-0.5, 0.5]
-            frame_verts = np.clip(vertices_seq[frame_idx].astype(np.float32), -0.5, 0.5)
-            verts_t = torch.from_numpy(frame_verts)
-
-            try:
-                voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
-                    vertices=verts_t,
-                    faces=faces_t,
-                    grid_size=res,
-                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                    face_weight=1.0,
-                    boundary_weight=0.2,
-                    regularization_weight=1e-2,
-                    timing=False,
-                )
-
-                # Encode dual vertices and intersected (same as data_toolkit/dual_grid.py)
-                dual_vertices = dual_vertices * res - voxel_indices
-                assert torch.all(dual_vertices >= -1e-3) and torch.all(dual_vertices <= 1 + 1e-3), \
-                    'dual_vertices out of range'
-                dual_vertices = torch.clamp(dual_vertices, 0, 1)
-                dual_vertices = (dual_vertices * 255).type(torch.uint8)
-                intersected = (intersected[:, 0:1] + 2 * intersected[:, 1:2] + 4 * intersected[:, 2:3]).type(torch.uint8)
-
-                o_voxel.io.write_vxz(
-                    output_path,
-                    voxel_indices,
-                    {'vertices': dual_vertices, 'intersected': intersected},
-                )
-            except Exception as e:
-                print(f"[ERROR] dual_grid failed: {shard_id}/{obj_id} frame={frame_idx} res={res}: {e}")
+            for frame_idx in range(num_frames):
+                output_path = os.path.join(output_dir, f'{frame_idx:06d}.vxz')
                 if os.path.exists(output_path):
-                    os.remove(output_path)
-                continue
-            finally:
-                # Explicitly free large tensors to prevent memory leak
-                del verts_t
+                    continue
+
+                # Get frame vertices, rotate to camera space, then clamp
+                frame_verts = vertices_seq[frame_idx].astype(np.float32)
+                frame_verts = frame_verts @ w2c_rot.T  # world -> camera (rotation only)
+                frame_verts = np.clip(frame_verts, -0.5, 0.5)
+                verts_t = torch.from_numpy(frame_verts)
+
                 try:
-                    del voxel_indices, dual_vertices, intersected
-                except NameError:
-                    pass
+                    voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
+                        vertices=verts_t,
+                        faces=faces_t,
+                        grid_size=res,
+                        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                        face_weight=1.0,
+                        boundary_weight=0.2,
+                        regularization_weight=1e-2,
+                        timing=False,
+                    )
+
+                    dual_vertices = dual_vertices * res - voxel_indices
+                    assert torch.all(dual_vertices >= -1e-3) and torch.all(dual_vertices <= 1 + 1e-3), \
+                        'dual_vertices out of range'
+                    dual_vertices = torch.clamp(dual_vertices, 0, 1)
+                    dual_vertices = (dual_vertices * 255).type(torch.uint8)
+                    intersected = (intersected[:, 0:1] + 2 * intersected[:, 1:2] + 4 * intersected[:, 2:3]).type(torch.uint8)
+
+                    o_voxel.io.write_vxz(
+                        output_path,
+                        voxel_indices,
+                        {'vertices': dual_vertices, 'intersected': intersected},
+                    )
+                except Exception as e:
+                    print(f"[ERROR] dual_grid failed: {shard_id}/{obj_id} view={view_idx} frame={frame_idx} res={res}: {e}")
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    continue
+                finally:
+                    del verts_t
+                    try:
+                        del voxel_indices, dual_vertices, intersected
+                    except NameError:
+                        pass
 
     del vertices_seq, faces, faces_t
-    return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'success', 'num_frames': num_frames}
+    return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'success', 'num_frames': num_frames, 'num_views': len(camera_views)}
 
 
 def load_progress(progress_path: str) -> dict:
