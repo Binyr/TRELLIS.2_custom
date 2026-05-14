@@ -94,6 +94,7 @@ def dual_grid_one_view(
         return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'missing_mesh', 'num_frames': 0}
 
     # Load camera rotation for this view
+    t_read_start = time.time()
     camera_views = load_camera_w2c_rotations(rendered_dir)
     if camera_views is None or view_idx not in camera_views:
         return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'missing_camera', 'num_frames': 0}
@@ -103,6 +104,7 @@ def dual_grid_one_view(
     with np.load(mesh_npz_path) as mesh_data:
         vertices_seq = mesh_data['vertices'].copy()  # (T, N, 3) float16
         faces = mesh_data['faces'].copy()             # (F, 3) int32
+    t_read = time.time() - t_read_start
 
     num_faces = faces.shape[0]
     if num_faces > 500000:
@@ -114,6 +116,8 @@ def dual_grid_one_view(
     faces_t = torch.from_numpy(faces).long()
 
     view_status = 'success'
+    t_compute = 0.0
+    t_write = 0.0
     for res in resolutions:
         output_dir = os.path.join(output_root, str(res), shard_id, obj_id, f'view_{view_idx:02d}')
         os.makedirs(output_dir, exist_ok=True)
@@ -130,6 +134,7 @@ def dual_grid_one_view(
             verts_t = torch.from_numpy(frame_verts)
 
             try:
+                t0 = time.time()
                 voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
                     vertices=verts_t,
                     faces=faces_t,
@@ -147,12 +152,15 @@ def dual_grid_one_view(
                 dual_vertices = torch.clamp(dual_vertices, 0, 1)
                 dual_vertices = (dual_vertices * 255).type(torch.uint8)
                 intersected = (intersected[:, 0:1] + 2 * intersected[:, 1:2] + 4 * intersected[:, 2:3]).type(torch.uint8)
+                t_compute += time.time() - t0
 
+                t0 = time.time()
                 o_voxel.io.write_vxz(
                     output_path,
                     voxel_indices,
                     {'vertices': dual_vertices, 'intersected': intersected},
                 )
+                t_write += time.time() - t0
             except Exception as e:
                 print(f"[ERROR] dual_grid failed: {shard_id}/{obj_id} view={view_idx} frame={frame_idx} res={res}: {e}")
                 if os.path.exists(output_path):
@@ -167,7 +175,9 @@ def dual_grid_one_view(
                     pass
 
     del vertices_seq, faces, faces_t
-    return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': view_status, 'num_frames': num_frames}
+    print(f"[TIMING] {shard_id}/{obj_id}/view_{view_idx:02d} read={t_read:.1f}s compute={t_compute:.1f}s write={t_write:.1f}s total={t_read+t_compute+t_write:.1f}s frames={num_frames}")
+    return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': view_status, 'num_frames': num_frames,
+            't_read': round(t_read, 2), 't_compute': round(t_compute, 2), 't_write': round(t_write, 2)}
 
 
 def load_progress(progress_path: str) -> dict:
