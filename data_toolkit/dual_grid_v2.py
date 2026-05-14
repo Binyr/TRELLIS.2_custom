@@ -22,8 +22,11 @@ Usage:
 """
 
 import argparse
+import io
 import json
 import os
+import tarfile
+import tempfile
 import time
 from pathlib import Path
 from multiprocessing import Pool
@@ -119,14 +122,17 @@ def dual_grid_one_view(
     t_compute = 0.0
     t_write = 0.0
     for res in resolutions:
-        output_dir = os.path.join(output_root, str(res), shard_id, obj_id, f'view_{view_idx:02d}')
+        output_dir = os.path.join(output_root, str(res), shard_id, obj_id)
         os.makedirs(output_dir, exist_ok=True)
+        tar_path = os.path.join(output_dir, f'view_{view_idx:02d}.tar')
 
+        # Skip if tar already exists
+        if os.path.exists(tar_path):
+            continue
+
+        # Compute all frames, collect vxz bytes in memory
+        frame_buffers = {}  # frame_idx -> bytes
         for frame_idx in range(num_frames):
-            output_path = os.path.join(output_dir, f'{frame_idx:06d}.vxz')
-            if os.path.exists(output_path):
-                continue
-
             # Get frame vertices, rotate to camera space, then clamp
             frame_verts = vertices_seq[frame_idx].astype(np.float32)
             frame_verts = frame_verts @ w2c_rot.T  # world -> camera (rotation only)
@@ -154,17 +160,21 @@ def dual_grid_one_view(
                 intersected = (intersected[:, 0:1] + 2 * intersected[:, 1:2] + 4 * intersected[:, 2:3]).type(torch.uint8)
                 t_compute += time.time() - t0
 
+                # Write vxz to a temp file, then read bytes
                 t0 = time.time()
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix='.vxz')
+                os.close(tmp_fd)
                 o_voxel.io.write_vxz(
-                    output_path,
+                    tmp_path,
                     voxel_indices,
                     {'vertices': dual_vertices, 'intersected': intersected},
                 )
+                with open(tmp_path, 'rb') as f:
+                    frame_buffers[frame_idx] = f.read()
+                os.remove(tmp_path)
                 t_write += time.time() - t0
             except Exception as e:
                 print(f"[ERROR] dual_grid failed: {shard_id}/{obj_id} view={view_idx} frame={frame_idx} res={res}: {e}")
-                if os.path.exists(output_path):
-                    os.remove(output_path)
                 view_status = 'error'
                 continue
             finally:
@@ -173,6 +183,19 @@ def dual_grid_one_view(
                     del voxel_indices, dual_vertices, intersected
                 except NameError:
                     pass
+
+        # Write all frames as a single tar to S3 (one write op)
+        if frame_buffers:
+            t0 = time.time()
+            with open(tar_path, 'wb') as fout:
+                with tarfile.open(fileobj=fout, mode='w') as tar:
+                    for fi in sorted(frame_buffers.keys()):
+                        data = frame_buffers[fi]
+                        info = tarfile.TarInfo(name=f'{fi:06d}.vxz')
+                        info.size = len(data)
+                        tar.addfile(info, io.BytesIO(data))
+            t_write += time.time() - t0
+            del frame_buffers
 
     del vertices_seq, faces, faces_t
     print(f"[TIMING] {shard_id}/{obj_id}/view_{view_idx:02d} read={t_read:.1f}s compute={t_compute:.1f}s write={t_write:.1f}s total={t_read+t_compute+t_write:.1f}s frames={num_frames}")
