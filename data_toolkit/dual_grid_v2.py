@@ -25,6 +25,7 @@ import argparse
 import io
 import json
 import os
+import shutil
 import tarfile
 import tempfile
 import time
@@ -185,16 +186,21 @@ def dual_grid_one_view(
                 except NameError:
                     pass
 
-        # Write all frames as a single tar to S3 (one write op)
+        # Write all frames as a single tar: first to local SSD, then copy to S3
         if frame_buffers:
             t0 = time.time()
-            with open(tar_path, 'wb') as fout:
+            local_tar_fd, local_tar_path = tempfile.mkstemp(suffix='.tar', dir=tmp_dir)
+            os.close(local_tar_fd)
+            with open(local_tar_path, 'wb') as fout:
                 with tarfile.open(fileobj=fout, mode='w') as tar:
                     for fi in sorted(frame_buffers.keys()):
                         data = frame_buffers[fi]
                         info = tarfile.TarInfo(name=f'{fi:06d}.vxz')
                         info.size = len(data)
                         tar.addfile(info, io.BytesIO(data))
+            # Single copy to S3
+            shutil.copy2(local_tar_path, tar_path)
+            os.remove(local_tar_path)
             t_write += time.time() - t0
             del frame_buffers
 
