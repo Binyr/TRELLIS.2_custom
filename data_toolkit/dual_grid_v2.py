@@ -67,8 +67,8 @@ def dual_grid_one_object(
         faces = mesh_data['faces'].copy()             # (F, 3) int32
 
     num_faces = faces.shape[0]
-    if num_faces > 500000:
-        return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}
+    # if num_faces > 500000:
+    #     return {'shard_id': shard_id, 'obj_id': obj_id, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}
 
     num_frames = vertices_seq.shape[0]
     faces_t = torch.from_numpy(faces).long()
@@ -140,6 +140,19 @@ def load_progress(progress_path: str) -> dict:
 def save_progress(progress_path: str, progress: dict):
     with open(progress_path, 'w') as f:
         json.dump(progress, f)
+
+
+def append_status_log(status_log_path: str, line: str):
+    """Append a line to status log. Uses read+write instead of 'a' mode for S3 compatibility."""
+    existing = ''
+    if os.path.exists(status_log_path):
+        try:
+            with open(status_log_path, 'r') as f:
+                existing = f.read()
+        except Exception:
+            pass
+    with open(status_log_path, 'w') as f:
+        f.write(existing + line + '\n')
 
 
 def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions):
@@ -274,8 +287,7 @@ def main():
             elapsed = time.time() - start_time
             avg_per_obj = elapsed / completed_count
             eta = avg_per_obj * (total_to_process - completed_count)
-            with open(status_log_path, 'a') as f:
-                f.write(f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg_per_obj:.1f}s/obj eta={eta:.0f}s\n")
+            append_status_log(status_log_path, f"{obj_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg_per_obj:.1f}s/obj eta={eta:.0f}s")
     else:
         # Multi-process with worker recycling to prevent memory leaks
         worker_fn = partial(
