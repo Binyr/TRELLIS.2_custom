@@ -163,15 +163,20 @@ def dual_grid_one_view(
                 dual_vertices = (dual_vertices * 255).type(torch.uint8)
                 intersected = (intersected[:, 0:1] + 2 * intersected[:, 1:2] + 4 * intersected[:, 2:3]).type(torch.uint8)
                 t_compute += time.time() - t0
-
+                t_compute_cur = time.time() - t0
                 t0 = time.time()
                 o_voxel.io.write_vxz(
                     local_vxz_path,
                     voxel_indices,
                     {'vertices': dual_vertices, 'intersected': intersected},
+                    compression='zstd',
+                    compression_level=3,
+                    num_threads=1,
                 )
-                t_write += time.time() - t0
+                t_write_cur = time.time() - t0
+                t_write += t_write_cur
                 frame_files.append((frame_idx, local_vxz_path))
+                print(f"t_write: {t_write_cur:.3f}s, t_compute_cur: {t_compute_cur:.3f}s")
             except Exception as e:
                 print(f"[ERROR] dual_grid failed: {shard_id}/{obj_id} view={view_idx} frame={frame_idx} res={res}: {e}")
                 view_status = 'error'
