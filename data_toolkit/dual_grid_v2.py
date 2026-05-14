@@ -22,11 +22,10 @@ Usage:
 """
 
 import argparse
-import io
 import json
 import os
+import shutil
 import tarfile
-import tempfile
 import time
 from pathlib import Path
 from multiprocessing import Pool
@@ -131,15 +130,19 @@ def dual_grid_one_view(
         if os.path.exists(tar_path):
             continue
 
-        # Compute all frames, collect vxz bytes in memory
-        frame_buffers = {}  # frame_idx -> bytes
+        # Local SSD temp directory for this view's vxz files
+        local_view_dir = os.path.join(tmp_dir, f'{shard_id}_{obj_id}_view{view_idx:02d}_res{res}')
+        os.makedirs(local_view_dir, exist_ok=True)
+
+        # Compute all frames, write vxz to local SSD
+        frame_files = []  # list of (frame_idx, local_path)
         for frame_idx in range(num_frames):
-            # Get frame vertices, rotate to camera space, then clamp
             frame_verts = vertices_seq[frame_idx].astype(np.float32)
             frame_verts = frame_verts @ w2c_rot.T  # world -> camera (rotation only)
             frame_verts = np.clip(frame_verts, -0.5, 0.5)
             verts_t = torch.from_numpy(frame_verts)
 
+            local_vxz_path = os.path.join(local_view_dir, f'{frame_idx:06d}.vxz')
             try:
                 t0 = time.time()
                 voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
@@ -161,19 +164,14 @@ def dual_grid_one_view(
                 intersected = (intersected[:, 0:1] + 2 * intersected[:, 1:2] + 4 * intersected[:, 2:3]).type(torch.uint8)
                 t_compute += time.time() - t0
 
-                # Write vxz to a temp file, then read bytes
                 t0 = time.time()
-                tmp_fd, tmp_path = tempfile.mkstemp(suffix='.vxz', dir=tmp_dir)
-                os.close(tmp_fd)
                 o_voxel.io.write_vxz(
-                    tmp_path,
+                    local_vxz_path,
                     voxel_indices,
                     {'vertices': dual_vertices, 'intersected': intersected},
                 )
-                with open(tmp_path, 'rb') as f:
-                    frame_buffers[frame_idx] = f.read()
-                os.remove(tmp_path)
                 t_write += time.time() - t0
+                frame_files.append((frame_idx, local_vxz_path))
             except Exception as e:
                 print(f"[ERROR] dual_grid failed: {shard_id}/{obj_id} view={view_idx} frame={frame_idx} res={res}: {e}")
                 view_status = 'error'
@@ -185,23 +183,19 @@ def dual_grid_one_view(
                 except NameError:
                     pass
 
-        # Write all frames as a single tar: first to local SSD, then copy to S3
-        if frame_buffers:
+        # Pack all vxz files into a tar on local SSD, then copy to S3
+        if frame_files:
             t0 = time.time()
-            local_tar_fd, local_tar_path = tempfile.mkstemp(suffix='.tar', dir=tmp_dir)
-            os.close(local_tar_fd)
-            with open(local_tar_path, 'wb') as fout:
-                with tarfile.open(fileobj=fout, mode='w') as tar:
-                    for fi in sorted(frame_buffers.keys()):
-                        data = frame_buffers[fi]
-                        info = tarfile.TarInfo(name=f'{fi:06d}.vxz')
-                        info.size = len(data)
-                        tar.addfile(info, io.BytesIO(data))
+            local_tar_path = os.path.join(local_view_dir, 'view.tar')
+            with tarfile.open(local_tar_path, 'w') as tar:
+                for fi, fpath in sorted(frame_files):
+                    tar.add(fpath, arcname=f'{fi:06d}.vxz')
             # Single copy to S3
             os.system(f'cp "{local_tar_path}" "{tar_path}"')
-            os.remove(local_tar_path)
             t_write += time.time() - t0
-            del frame_buffers
+
+        # Clean up local temp dir
+        shutil.rmtree(local_view_dir, ignore_errors=True)
 
     del vertices_seq, faces, faces_t
     print(f"[TIMING] {shard_id}/{obj_id}/view_{view_idx:02d} read={t_read:.1f}s compute={t_compute:.1f}s write={t_write:.1f}s total={t_read+t_compute+t_write:.1f}s frames={num_frames}")
