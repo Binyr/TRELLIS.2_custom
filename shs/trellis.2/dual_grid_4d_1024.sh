@@ -1,3 +1,6 @@
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
 python data_toolkit/dual_grid_v2.py \
   --ann_file data/objverse_minghao_4d_mine_40075/rendering_v5_anns_8cam.json \
   --rendered_root data/objverse_minghao_4d_mine_40075/rendering_v5 \

@@ -169,6 +169,7 @@ def dual_grid_one_view(
                     local_vxz_path,
                     voxel_indices,
                     {'vertices': dual_vertices, 'intersected': intersected},
+                    num_threads=1,
                 )
                 t_write_cur = time.time() - t0
                 t_write += t_write_cur
