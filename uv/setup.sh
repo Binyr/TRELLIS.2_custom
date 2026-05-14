@@ -297,9 +297,9 @@ if [ ! -d "/tmp/extensions/nvdiffrast" ] ; then
 fi
 uv pip install /tmp/extensions/nvdiffrast --no-build-isolation
 
-# o-voxel (includes cumesh, flexgemm as dependencies)
+# o-voxel (pre-built wheel to avoid high memory usage during compilation)
 echo "[INSTALL] o-voxel..."
-uv pip install o-voxel/ --no-build-isolation
+uv pip install /efs/yanruibin/packages/o_voxel-0.0.1-cp312-cp312-linux_x86_64.whl
 
 # Blender (for dump_pbr_4d.py)
 echo "[INSTALL] Blender 4.5.1..."
