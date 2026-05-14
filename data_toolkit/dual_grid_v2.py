@@ -83,6 +83,7 @@ def dual_grid_one_view(
     rendered_root: str,
     output_root: str,
     resolutions: list,
+    tmp_dir: str = '/tmp',
     debug: bool = False,
 ):
     """
@@ -162,7 +163,7 @@ def dual_grid_one_view(
 
                 # Write vxz to a temp file, then read bytes
                 t0 = time.time()
-                tmp_fd, tmp_path = tempfile.mkstemp(suffix='.vxz')
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix='.vxz', dir=tmp_dir)
                 os.close(tmp_fd)
                 o_voxel.io.write_vxz(
                     tmp_path,
@@ -229,7 +230,7 @@ def append_status_log(status_log_path: str, line: str):
         f.write(existing + line + '\n')
 
 
-def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, debug=False):
+def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, tmp_dir='/tmp', debug=False):
     """Wrapper for Pool.imap_unordered: processes one (shard_id, obj_id, view_idx) task."""
     shard_id, obj_id, view_idx = args_tuple
     try:
@@ -240,6 +241,7 @@ def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, debug=F
             rendered_root=rendered_root,
             output_root=output_root,
             resolutions=resolutions,
+            tmp_dir=tmp_dir,
             debug=debug,
         )
     except Exception as e:
@@ -270,12 +272,16 @@ def main():
                         help='Path to file with priority obj_ids (one per line), these will be processed first')
     parser.add_argument('--debug', action='store_true',
                         help='Debug mode: only process 1 view and 1 frame per object')
+    parser.add_argument('--tmp_dir', type=str, default='/local-ssd/tmp_dual_grid',
+                        help='Local SSD path for temp files (default: /local-ssd/tmp_dual_grid)')
     args = parser.parse_args()
 
     resolutions = [int(x) for x in args.resolution.split(',')]
     print(f"Resolutions: {resolutions}")
     if args.debug:
         print("[DEBUG MODE] Only 1 view and 1 frame per object")
+    os.makedirs(args.tmp_dir, exist_ok=True)
+    print(f"Temp dir: {args.tmp_dir}")
 
     # Load annotations
     with open(args.ann_file, 'r') as f:
@@ -361,6 +367,7 @@ def main():
                 rendered_root=args.rendered_root,
                 output_root=args.output_root,
                 resolutions=resolutions,
+                tmp_dir=args.tmp_dir,
                 debug=args.debug,
             )
             view_key = f"{shard_id}/{obj_id}/view_{view_idx:02d}"
@@ -378,6 +385,7 @@ def main():
             rendered_root=args.rendered_root,
             output_root=args.output_root,
             resolutions=resolutions,
+            tmp_dir=args.tmp_dir,
             debug=args.debug,
         )
         with Pool(processes=args.max_workers, maxtasksperchild=1) as pool:
