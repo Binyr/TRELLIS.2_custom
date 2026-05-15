@@ -299,6 +299,7 @@ echo "[INSTALL] cumesh, flex_gemm, o-voxel (pre-built wheels)..."
 uv pip install /threed-code/yanruibin/efs/packages/cumesh-0.0.1-cp312-cp312-linux_x86_64.whl
 uv pip install /threed-code/yanruibin/efs/packages/flex_gemm-1.0.0-cp312-cp312-linux_x86_64.whl
 uv pip install /threed-code/yanruibin/efs/packages/o_voxel-0.0.1-cp312-cp312-linux_x86_64.whl --no-deps
+uv pip install plyfile zstandard
 
 # Blender (for dump_pbr_4d.py)
 echo "[INSTALL] Blender 4.5.1..."
