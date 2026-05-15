@@ -181,7 +181,7 @@ apt install -y  libegl1
 # cd third_party/torchsparse
 # uv pip install . --no-build-isolation
 # cd $x
-uv pip install /efs/yanruibin/packages/torchsparse-2.1.0-cp312-cp312-linux_x86_64.whl
+uv pip install /threed-code/yanruibin/efs/packages/torchsparse-2.1.0-cp312-cp312-linux_x86_64.whl
 
 echo "[INSTALL] requirements_v2.txt..."
 apt install -y python3.12-dev # Triton 在初始化时需要编译一个小的 C 文件，要用到 Python 头文件，但系统没装 Python dev 包
@@ -195,8 +195,8 @@ echo "[INSTALL] direct3ds2_train (editable)..."
 uv pip install pytorch_lightning
 uv pip install wandb
 uv pip install lightning
-uv pip install /efs/yanruibin/packages/natten-0.21.1+torch280cu128-cp312-cp312-linux_x86_64.whl
-uv pip install /efs/yanruibin/packages/utils3d-1.7-py3-none-any.whl
+uv pip install /threed-code/yanruibin/efs/packages/natten-0.21.1+torch280cu128-cp312-cp312-linux_x86_64.whl
+uv pip install /threed-code/yanruibin/efs/packages/utils3d-1.7-py3-none-any.whl
 uv pip install tensorboard
 uv pip install flash-attn-4==4.0.0b8
 
@@ -292,13 +292,13 @@ fi
 
 # nvdiffrast (pre-built wheel, required by o_voxel)
 echo "[INSTALL] nvdiffrast..."
-uv pip install /efs/yanruibin/packages/nvdiffrast-0.4.0-cp312-cp312-linux_x86_64.whl
+uv pip install /threed-code/yanruibin/efs/packages/nvdiffrast-0.4.0-cp312-cp312-linux_x86_64.whl
 
 # o-voxel and its compiled dependencies (pre-built wheels to avoid high memory usage)
 echo "[INSTALL] cumesh, flex_gemm, o-voxel (pre-built wheels)..."
-uv pip install /efs/yanruibin/packages/cumesh-0.0.1-cp312-cp312-linux_x86_64.whl
-uv pip install /efs/yanruibin/packages/flex_gemm-1.0.0-cp312-cp312-linux_x86_64.whl
-uv pip install /efs/yanruibin/packages/o_voxel-0.0.1-cp312-cp312-linux_x86_64.whl --no-deps
+uv pip install /threed-code/yanruibin/efs/packages/cumesh-0.0.1-cp312-cp312-linux_x86_64.whl
+uv pip install /threed-code/yanruibin/efs/packages/flex_gemm-1.0.0-cp312-cp312-linux_x86_64.whl
+uv pip install /threed-code/yanruibin/efs/packages/o_voxel-0.0.1-cp312-cp312-linux_x86_64.whl --no-deps
 
 # Blender (for dump_pbr_4d.py)
 echo "[INSTALL] Blender 4.5.1..."
