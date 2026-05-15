@@ -289,13 +289,9 @@ if [ ! -f "o-voxel/third_party/eigen/Eigen/Dense" ] ; then
     git clone --depth 1 https://gitlab.com/libeigen/eigen.git o-voxel/third_party/eigen
 fi
 
-# nvdiffrast (required by o_voxel)
+# nvdiffrast (pre-built wheel, required by o_voxel)
 echo "[INSTALL] nvdiffrast..."
-mkdir -p /tmp/extensions
-if [ ! -d "/tmp/extensions/nvdiffrast" ] ; then
-    git clone -b v0.4.0 https://github.com/NVlabs/nvdiffrast.git /tmp/extensions/nvdiffrast
-fi
-uv pip install /tmp/extensions/nvdiffrast --no-build-isolation
+uv pip install /efs/yanruibin/packages/nvdiffrast-0.4.0-cp312-cp312-linux_x86_64.whl
 
 # o-voxel and its compiled dependencies (pre-built wheels to avoid high memory usage)
 echo "[INSTALL] cumesh, flex_gemm, o-voxel (pre-built wheels)..."
