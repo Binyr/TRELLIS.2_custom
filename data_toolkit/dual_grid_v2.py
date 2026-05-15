@@ -306,51 +306,46 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(args.output_root, exist_ok=True)
 
-    # Load progress from ALL ranks to get global completion status (view-level)
-    all_progress = {}
-    import glob
-    progress_files = glob.glob(os.path.join(log_dir, 'progress_*.json'))
-    for p_path in progress_files:
-        try:
-            with open(p_path, 'r') as f:
-                all_progress.update(json.load(f))
-        except Exception as e:
-            print(f"[WARN] Failed to read {p_path}: {e}")
-    print(f"Loaded global progress: {len(all_progress)} completed views from {len(progress_files)} files")
-
-    # Build per-view task list, filtering out completed views
+    # Build full per-view task list (deterministic order)
     views_to_use = EXPECTED_VIEWS if not args.debug else EXPECTED_VIEWS[:1]
-    to_process = []  # list of (shard_id, obj_id, view_idx)
-    skipped_views = 0
+    all_views = []  # list of (shard_id, obj_id, view_idx)
     for entry in entries:
         shard_id, obj_id = parse_entry(entry)
         for v in views_to_use:
-            view_key = f"{shard_id}/{obj_id}/view_{v:02d}"
-            if view_key in all_progress and all_progress[view_key].get('status') == 'success':
-                skipped_views += 1
-                continue
-            to_process.append((shard_id, obj_id, v))
+            all_views.append((shard_id, obj_id, v))
 
-    print(f"To process: {len(to_process)} views ({skipped_views} already completed)")
+    print(f"Total views: {len(all_views)}")
 
-    # Sort by priority: priority_list obj_ids first
+    # Sort by priority BEFORE sharding (so priority objects go first in all ranks)
     if args.priority_list and os.path.exists(args.priority_list):
         with open(args.priority_list, 'r') as f:
             priority_ids = set(line.strip() for line in f if line.strip())
-        priority_views = [(s, o, v) for s, o, v in to_process if o in priority_ids]
-        non_priority_views = [(s, o, v) for s, o, v in to_process if o not in priority_ids]
-        to_process = priority_views + non_priority_views
+        priority_views = [(s, o, v) for s, o, v in all_views if o in priority_ids]
+        non_priority_views = [(s, o, v) for s, o, v in all_views if o not in priority_ids]
+        all_views = priority_views + non_priority_views
         print(f"Priority list: {len(priority_ids)} ids, {len(priority_views)} views matched")
 
-    # THEN shard
-    start = len(to_process) * args.rank // args.world_size
-    end = len(to_process) * (args.rank + 1) // args.world_size
-    to_process = to_process[start:end]
-    print(f"Rank {args.rank}/{args.world_size}: assigned {len(to_process)} views")
+    # Shard FIRST (deterministic, rank always gets the same chunk)
+    start = len(all_views) * args.rank // args.world_size
+    end = len(all_views) * (args.rank + 1) // args.world_size
+    my_views = all_views[start:end]
+    print(f"Rank {args.rank}/{args.world_size}: assigned {len(my_views)} views")
 
     # Per-rank progress file
     progress_path = os.path.join(log_dir, f'progress_{args.rank}.json')
     progress = load_progress(progress_path)
+
+    # THEN filter out completed views (only check this rank's progress)
+    to_process = []
+    skipped_views = 0
+    for s, o, v in my_views:
+        view_key = f"{s}/{o}/view_{v:02d}"
+        if view_key in progress and progress[view_key].get('status') == 'success':
+            skipped_views += 1
+            continue
+        to_process.append((s, o, v))
+
+    print(f"To process: {len(to_process)} views ({skipped_views} already completed)")
 
     if len(to_process) == 0:
         print("Nothing to do.")
