@@ -5,4 +5,5 @@ python data_toolkit/dual_grid_v2.py \
   --resolution 1024 \
   --max_workers 8 \
   --priority_list claude_tmp/objv1_sketchfab_intersection.txt \
+  --finished_views /local-ssd/data2/trellis.2/dual_grid_4d_v3/finished_views_1024.json \
   --world_size ${1:-1} --rank ${2:-0}

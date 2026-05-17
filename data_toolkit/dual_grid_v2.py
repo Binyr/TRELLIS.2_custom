@@ -275,6 +275,8 @@ def main():
                         help='Number of parallel processes')
     parser.add_argument('--priority_list', type=str, default=None,
                         help='Path to file with priority obj_ids (one per line), these will be processed first')
+    parser.add_argument('--finished_views', type=str, default=None,
+                        help='Path to JSON file with list of already finished view keys to skip before sharding')
     parser.add_argument('--debug', action='store_true',
                         help='Debug mode: only process 1 view and 1 frame per object')
     parser.add_argument('--tmp_dir', type=str, default='/local-ssd/tmp_dual_grid',
@@ -324,6 +326,14 @@ def main():
         non_priority_views = [(s, o, v) for s, o, v in all_views if o not in priority_ids]
         all_views = priority_views + non_priority_views
         print(f"Priority list: {len(priority_ids)} ids, {len(priority_views)} views matched")
+
+    # Filter out globally finished views BEFORE sharding
+    if args.finished_views and os.path.exists(args.finished_views):
+        with open(args.finished_views, 'r') as f:
+            finished_set = set(json.load(f))
+        before_count = len(all_views)
+        all_views = [(s, o, v) for s, o, v in all_views if f"{s}/{o}/view_{v:02d}" not in finished_set]
+        print(f"Finished views filter: {before_count} -> {len(all_views)} ({before_count - len(all_views)} removed)")
 
     # Shard FIRST (deterministic, rank always gets the same chunk)
     start = len(all_views) * args.rank // args.world_size
