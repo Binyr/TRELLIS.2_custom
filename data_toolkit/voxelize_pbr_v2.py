@@ -144,6 +144,8 @@ def voxelize_pbr_one_view(
     resolutions: list,
     tmp_dir: str = '/tmp',
     debug: bool = False,
+    vxz_compression: str = 'lzma',
+    vxz_compression_level: int = 9,
 ):
     """
     Voxelize all frames of one object for ONE camera view to PBR O-Voxels.
@@ -233,7 +235,10 @@ def voxelize_pbr_one_view(
                 t_compute_cur = time.time() - t0
 
                 t0 = time.time()
-                o_voxel.io.write_vxz(local_vxz_path, coord, attr)
+                write_kwargs = {'compression': vxz_compression}
+                if vxz_compression != 'none':
+                    write_kwargs['compression_level'] = vxz_compression_level
+                o_voxel.io.write_vxz(local_vxz_path, coord, attr, **write_kwargs)
                 t_write_cur = time.time() - t0
                 t_write += t_write_cur
                 frame_files.append((frame_idx, local_vxz_path))
@@ -301,6 +306,8 @@ def _worker_wrapper(
     resolutions,
     tmp_dir='/tmp',
     debug=False,
+    vxz_compression='lzma',
+    vxz_compression_level=9,
 ):
     """Wrapper for Pool.imap_unordered: processes one (shard_id, obj_id, view_idx) task."""
     shard_id, obj_id, view_idx = args_tuple
@@ -315,6 +322,8 @@ def _worker_wrapper(
             resolutions=resolutions,
             tmp_dir=tmp_dir,
             debug=debug,
+            vxz_compression=vxz_compression,
+            vxz_compression_level=vxz_compression_level,
         )
     except Exception as e:
         print(f"[ERROR] {shard_id}/{obj_id}/view_{view_idx:02d}: {e}")
@@ -367,10 +376,16 @@ def main():
                         help='Debug mode: only process 1 view and 1 frame per object')
     parser.add_argument('--tmp_dir', type=str, default='/local-ssd/tmp_voxelize_pbr',
                         help='Local SSD path for temp files (default: /local-ssd/tmp_voxelize_pbr)')
+    parser.add_argument('--vxz_compression', type=str, default='lzma',
+                        choices=['none', 'deflate', 'lzma', 'zstd'],
+                        help='Compression algorithm for write_vxz output')
+    parser.add_argument('--vxz_compression_level', type=int, default=9,
+                        help='Compression level for write_vxz (ignored when compression=none)')
     args = parser.parse_args()
 
     resolutions = [int(x) for x in args.resolution.split(',')]
     print(f"Resolutions: {resolutions}")
+    print(f"VXZ compression: {args.vxz_compression} level={args.vxz_compression_level}")
     if args.debug:
         print("[DEBUG MODE] Only 1 view and 1 frame per object")
     os.makedirs(args.tmp_dir, exist_ok=True)
@@ -456,6 +471,8 @@ def main():
                 resolutions=resolutions,
                 tmp_dir=args.tmp_dir,
                 debug=args.debug,
+                vxz_compression=args.vxz_compression,
+                vxz_compression_level=args.vxz_compression_level,
             )
             view_key = f"{shard_id}/{obj_id}/view_{view_idx:02d}"
             progress[view_key] = result
@@ -477,6 +494,8 @@ def main():
             resolutions=resolutions,
             tmp_dir=args.tmp_dir,
             debug=args.debug,
+            vxz_compression=args.vxz_compression,
+            vxz_compression_level=args.vxz_compression_level,
         )
         with Pool(processes=args.max_workers, maxtasksperchild=1) as pool:
             results_iter = pool.imap_unordered(worker_fn, to_process)
