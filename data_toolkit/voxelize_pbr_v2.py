@@ -32,6 +32,7 @@ import shutil
 import sys
 import tarfile
 import time
+import traceback
 from pathlib import Path
 from multiprocessing import Pool
 from functools import partial
@@ -79,6 +80,24 @@ def append_status_log(status_log_path: str, line: str):
             pass
     with open(status_log_path, 'w') as f:
         f.write(existing + line + '\n')
+
+
+def sync_stdout_log():
+    """Copy local stdout log to EFS. Paths come from shell env vars."""
+    local_path = os.environ.get('VOXELIZE_PBR_STDOUT_LOCAL')
+    remote_path = os.environ.get('VOXELIZE_PBR_STDOUT_REMOTE')
+    if not local_path or not remote_path or not os.path.isfile(local_path):
+        return
+    try:
+        os.makedirs(os.path.dirname(remote_path), exist_ok=True)
+        shutil.copy2(local_path, remote_path)
+    except Exception as e:
+        print(f"[WARN] stdout sync failed: {e}")
+
+
+def write_fatal_status(status_log_path: str, rank: int, error: BaseException):
+    append_status_log(status_log_path, f"FATAL rank={rank} error={error}")
+    sync_stdout_log()
 
 
 def compute_face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
@@ -391,6 +410,20 @@ def main():
     os.makedirs(args.tmp_dir, exist_ok=True)
     print(f"Temp dir: {args.tmp_dir}")
 
+    res_tag = args.resolution.replace(',', '_')
+    log_dir = os.path.join(args.output_root, f'log_{res_tag}')
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(args.output_root, exist_ok=True)
+    status_log_path = os.path.join(log_dir, f'status_{args.rank}.log')
+
+    try:
+        _run_main(args, resolutions, log_dir, status_log_path)
+    except Exception as e:
+        traceback.print_exc()
+        write_fatal_status(status_log_path, args.rank, e)
+
+
+def _run_main(args, resolutions, log_dir, status_log_path):
     with open(args.ann_file, 'r') as f:
         ann_data = json.load(f)
 
@@ -401,11 +434,6 @@ def main():
         entries.extend(ann_data.get('test', []))
 
     print(f"Total entries (objects): {len(entries)}")
-
-    res_tag = args.resolution.replace(',', '_')
-    log_dir = os.path.join(args.output_root, f'log_{res_tag}')
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(args.output_root, exist_ok=True)
 
     views_to_use = EXPECTED_VIEWS if not args.debug else EXPECTED_VIEWS[:1]
     all_views = []
@@ -452,29 +480,39 @@ def main():
 
     if len(to_process) == 0:
         print("Nothing to do.")
+        sync_stdout_log()
         return
 
-    status_log_path = os.path.join(log_dir, f'status_{args.rank}.log')
     total_to_process = len(to_process)
     completed_count = 0
     start_time = time.time()
 
     if args.max_workers <= 1:
         for shard_id, obj_id, view_idx in tqdm(to_process, desc="Voxelize PBR 4D"):
-            result = voxelize_pbr_one_view(
-                shard_id=shard_id,
-                obj_id=obj_id,
-                view_idx=view_idx,
-                pbr_shared_root=args.pbr_shared_root,
-                rendered_root=args.rendered_root,
-                output_root=args.output_root,
-                resolutions=resolutions,
-                tmp_dir=args.tmp_dir,
-                debug=args.debug,
-                vxz_compression=args.vxz_compression,
-                vxz_compression_level=args.vxz_compression_level,
-            )
             view_key = f"{shard_id}/{obj_id}/view_{view_idx:02d}"
+            try:
+                result = voxelize_pbr_one_view(
+                    shard_id=shard_id,
+                    obj_id=obj_id,
+                    view_idx=view_idx,
+                    pbr_shared_root=args.pbr_shared_root,
+                    rendered_root=args.rendered_root,
+                    output_root=args.output_root,
+                    resolutions=resolutions,
+                    tmp_dir=args.tmp_dir,
+                    debug=args.debug,
+                    vxz_compression=args.vxz_compression,
+                    vxz_compression_level=args.vxz_compression_level,
+                )
+            except Exception as e:
+                print(f"[ERROR] {view_key}: {e}")
+                result = {
+                    'shard_id': shard_id,
+                    'obj_id': obj_id,
+                    'view_idx': view_idx,
+                    'status': 'error',
+                    'error': str(e),
+                }
             progress[view_key] = result
             save_progress(progress_path, progress)
             completed_count += 1
@@ -485,6 +523,7 @@ def main():
                 status_log_path,
                 _format_status_log_line(view_key, result, completed_count, total_to_process, avg_per_view, eta),
             )
+            sync_stdout_log()
     else:
         worker_fn = partial(
             _worker_wrapper,
@@ -512,6 +551,7 @@ def main():
                         status_log_path,
                         _format_status_log_line(view_key, result, completed_count, total_to_process, avg_per_view, eta),
                     )
+                    sync_stdout_log()
                     pbar.set_postfix_str(f"avg={avg_per_view:.1f}s/view eta={eta:.0f}s")
                     pbar.update(1)
 
@@ -521,7 +561,12 @@ def main():
         statuses[s] = statuses.get(s, 0) + 1
     print(f"\nFinal summary (view-level): {statuses}")
     print(f"Total views tracked: {len(progress)}")
+    sync_stdout_log()
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        sys.exit(0)
