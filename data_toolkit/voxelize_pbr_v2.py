@@ -25,6 +25,7 @@ Usage:
 
 import argparse
 import copy
+import gc
 import json
 import os
 import pickle
@@ -47,6 +48,13 @@ EXPECTED_VIEWS = [0, 2, 4, 6, 8, 10, 12, 14]
 
 # View statuses that should not be retried on resume.
 SKIP_STATUSES = {'success', 'missing_pbr', 'missing_mesh', 'face_mismatch'}
+
+GC_EVERY_VIEWS = max(1, int(os.environ.get('VOXELIZE_PBR_GC_EVERY', '10')))
+
+
+def maybe_collect_gc(completed_count: int):
+    if completed_count % GC_EVERY_VIEWS == 0:
+        gc.collect()
 
 
 def parse_entry(entry: str):
@@ -409,6 +417,7 @@ def main():
         print("[DEBUG MODE] Only 1 view and 1 frame per object")
     os.makedirs(args.tmp_dir, exist_ok=True)
     print(f"Temp dir: {args.tmp_dir}")
+    print(f"GC every {GC_EVERY_VIEWS} views")
 
     res_tag = args.resolution.replace(',', '_')
     log_dir = os.path.join(args.output_root, f'log_{res_tag}')
@@ -524,6 +533,7 @@ def _run_main(args, resolutions, log_dir, status_log_path):
                 _format_status_log_line(view_key, result, completed_count, total_to_process, avg_per_view, eta),
             )
             sync_stdout_log()
+            maybe_collect_gc(completed_count)
     else:
         worker_fn = partial(
             _worker_wrapper,
@@ -552,6 +562,7 @@ def _run_main(args, resolutions, log_dir, status_log_path):
                         _format_status_log_line(view_key, result, completed_count, total_to_process, avg_per_view, eta),
                     )
                     sync_stdout_log()
+                    maybe_collect_gc(completed_count)
                     pbar.set_postfix_str(f"avg={avg_per_view:.1f}s/view eta={eta:.0f}s")
                     pbar.update(1)
 
@@ -562,6 +573,7 @@ def _run_main(args, resolutions, log_dir, status_log_path):
     print(f"\nFinal summary (view-level): {statuses}")
     print(f"Total views tracked: {len(progress)}")
     sync_stdout_log()
+    gc.collect()
 
 
 if __name__ == '__main__':

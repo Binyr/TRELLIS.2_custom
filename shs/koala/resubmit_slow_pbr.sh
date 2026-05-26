@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Resubmit pbr ranks: not running + last status avg > 2000s/view (2026-05-23)
+# Resubmit pbr ranks: not running + last status avg > 1200s/view (2026-05-26)
 
 num_chunk=170
 
-for i in 9 10 11 12 13 14 15 16 18 20 21 22 26 27 28 30 31 35 44 48 54 56 60 61 62 63 64 65 66 67 68 69 70 76 78 85 86 89 91 92 93 97 98 99 105 107 108 109 112 115 118 119 120 121 123 125 128 131 133 137 138 139 142 143 145 146 157 162 167; do
+for i in 0 1 2 3 4 6 7 9 17 19 21 23 24 25 26 29 30 32 33 34 38 39 41 42 43 44 46 47 49 50 52 55 57 59 69 70 73 75 76 80 81 82 83 85 87 97 103 106 116 117 121 122 123 124 125 126 127 128 129 130 131 132 133 134 135 136 137 138 139 140 141 143 145 147 148 149 150 151 152 154 155 156 157 159 160 161 162 163 164 165 166 167 168 169; do
     echo "Submitting job for chunk $i, num_chunk $num_chunk"
     koala submit -m normal \
         --code s3://arcwm-code-us-west-2/yanruibin/code_1779550875/run_codes:/data/work/run_codes \
