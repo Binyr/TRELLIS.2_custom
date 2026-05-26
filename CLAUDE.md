@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 不要修改远程的环境，如果环境有问题，请立刻停止并报告给我
 
-你的远程目录为`/local-ssd/xxx/`
+你的远程目录为`/local-ssd/TRELLIS.2/`
 
 远程的环境，通过在远程仓库目录下，`source .venv/bin/activate`激活
 
@@ -28,6 +28,17 @@ data里的东西不允许修改
 你在运行时的任何中间结果，都存储在本仓库的claude_tmp下面，不要本仓库之外，以避免不断询问权限
 
 我授权给你本仓库的所有权限，包括读写
+
+有环境问题及时报告，不要修改环境，也不要因为环境限制改代码；blender的环境你可以随意安装库
+
+远程机器网盘地址：s3://arcwm-code-us-west-2/
+
+跳板机连接方式：ssh  yanruibin@yanruibin-any2.devcloud.woa.com -p 36000 
+koala 只能在跳板机使用
+跳板机 koala 使用：
+查看运行中的任务: koala list
+查看失败的任务: koala list -s failed
+删除任务：koala delete -y 任务名
 
 ## Project Overview
 

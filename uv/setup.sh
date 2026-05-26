@@ -300,6 +300,7 @@ uv pip install /threed-code/yanruibin/efs/packages/cumesh-0.0.1-cp312-cp312-linu
 uv pip install /threed-code/yanruibin/efs/packages/flex_gemm-1.0.0-cp312-cp312-linux_x86_64.whl
 uv pip install /threed-code/yanruibin/efs/packages/o_voxel-0.0.1-cp312-cp312-linux_x86_64.whl --no-deps
 uv pip install plyfile zstandard
+uv pip install natsort
 
 # Blender (for dump_pbr_4d.py)
 echo "[INSTALL] Blender 4.5.1..."
@@ -308,7 +309,7 @@ if [ ! -f "$BLENDER_PATH" ] ; then
     wget -q https://ftp.halifax.rwth-aachen.de/blender/release/Blender4.5/blender-4.5.1-linux-x64.tar.xz -O /tmp/blender-4.5.1-linux-x64.tar.xz
     tar -xf /tmp/blender-4.5.1-linux-x64.tar.xz -C /tmp/
 fi
-/tmp/blender-4.5.1-linux-x64/4.5/python/bin/python3.11 -m pip install -q pillow
+/tmp/blender-4.5.1-linux-x64/4.5/python/bin/python3.11 -m pip install -q pillow av
 echo "[DONE] Blender ready at: $BLENDER_PATH"
 
 echo "[SETUP COMPLETE] Total time: $(( SECONDS - _SETUP_START_TIME )) seconds"
