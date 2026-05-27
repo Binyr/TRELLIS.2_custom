@@ -29,6 +29,25 @@ export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export PYTHONUNBUFFERED=1
 
+# Detect cgroup CPU quota so multi-threaded libs (x265, OpenMP, MKL, ...)
+# do not spawn `nproc` (host-side, 192) threads inside a 24-core slice and
+# thrash on CFS throttling.
+CPU_QUOTA=0
+if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    CPU_QUOTA=$(awk '{ if ($1 == "max") print 0; else printf "%d\n", ($1+$2-1)/$2 }' /sys/fs/cgroup/cpu.max)
+elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+    q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+    p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    [[ "$q" -gt 0 && "$p" -gt 0 ]] && CPU_QUOTA=$(( (q + p - 1) / p ))
+fi
+if (( CPU_QUOTA > 0 )); then
+    export OMP_NUM_THREADS=$CPU_QUOTA
+    export MKL_NUM_THREADS=$CPU_QUOTA
+    export OPENBLAS_NUM_THREADS=$CPU_QUOTA
+    export NUMEXPR_NUM_THREADS=$CPU_QUOTA
+    export BLENDER_NUM_THREADS=$CPU_QUOTA
+fi
+
 GLOBAL_WS=${1:-1}
 GLOBAL_RANK=${2:-0}
 
@@ -36,13 +55,14 @@ BLENDER_PER_GPU=${BLENDER_PER_GPU:-2}
 RESPAWN_SLEEP=${RESPAWN_SLEEP:-30}
 STDOUT_SYNC_SEC=${STDOUT_SYNC_SEC:-60}
 MAX_RESPAWN=${MAX_RESPAWN:-1000000}
+MAX_CONSEC_FAILURES=${MAX_CONSEC_FAILURES:-10}  # give up a worker after this many back-to-back crashes
 FAIL_FAST=${FAIL_FAST:-0}
 MAX_ITEMS=${MAX_ITEMS:-}   # if non-empty, passed through to each worker for smoke tests
 
 # Config (mirrors shs/render_dynamic_obj.sh).
 BLENDER_PATH="/tmp/blender-4.5.1-linux-x64/blender"
 MANIFEST="/threed-code/yanruibin/efs/4D_video_data_process/data/objxl/dynamic_obj_manifest.json"
-S3_OUTPUT_ROOT="s3://arcwm-code-us-west-2/yanruibin/4D_video_data_process/data/objxl/dynamic_obj_rendered"
+S3_OUTPUT_ROOT="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/objxl/dynamic_obj_rendered"
 LOCAL_OUTPUT_ROOT="/local-ssd/dynamic_obj_rendered"
 LOCAL_TMP_ROOT="/local-ssd/tmp_extract"
 LOCAL_STATE_ROOT="/local-ssd/render_dynamic_obj_state"
@@ -73,6 +93,7 @@ echo "  GLOBAL_RANK       = $GLOBAL_RANK"
 echo "  detected GPUs     = $G"
 echo "  BLENDER_PER_GPU   = $BLENDER_PER_GPU"
 echo "  workers this pod  = $TOTAL_PER_POD"
+echo "  cgroup CPU quota  = $CPU_QUOTA cores  (nproc=$(nproc))"
 echo "  effective WS      = $SUB_WS"
 echo "  rank range        = [$SUB_RANK_BASE, $((SUB_RANK_BASE + TOTAL_PER_POD - 1))]"
 echo "  FAIL_FAST         = $FAIL_FAST"
@@ -126,6 +147,9 @@ worker_supervisor() {
         max_items_arg=(--max_items "$MAX_ITEMS")
     fi
 
+    local consec_failures=0
+    local last_items_done=0
+    local hb_file="$LOCAL_STATE_ROOT/rank_${rank}/heartbeat_${rank}.json"
     while (( attempts < MAX_RESPAWN )); do
         attempts=$((attempts + 1))
         echo "[supervisor:r${rank}] attempt #$attempts gpu=$gpu tag=$worker_tag pid_parent=$$" \
@@ -167,12 +191,42 @@ worker_supervisor() {
             kill -TERM $$ 2>/dev/null || true
             break
         fi
-        echo "[supervisor:r${rank}] sleeping ${RESPAWN_SLEEP}s before respawn"
+        # If the worker made forward progress this attempt, reset the
+        # consecutive-failure counter so transient errors do not exhaust
+        # the budget.
+        local cur_items_done=0
+        if [[ -r "$hb_file" ]]; then
+            cur_items_done=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('items_done',0))" "$hb_file" 2>/dev/null || echo 0)
+        fi
+        if (( cur_items_done > last_items_done )); then
+            consec_failures=0
+        else
+            consec_failures=$((consec_failures + 1))
+        fi
+        last_items_done=$cur_items_done
+
+        if (( consec_failures >= MAX_CONSEC_FAILURES )); then
+            echo "[supervisor:r${rank}] giving up after $consec_failures consecutive failures (items_done=$cur_items_done)" \
+                | tee -a "$death_log"
+            aws s3 cp --only-show-errors "$death_log" "$S3_OUTPUT_ROOT/logs/deaths.log" 2>/dev/null || true
+            break
+        fi
+        echo "[supervisor:r${rank}] consec_failures=$consec_failures items_done=$cur_items_done, sleeping ${RESPAWN_SLEEP}s before respawn"
         sleep "$RESPAWN_SLEEP"
     done
 
     kill "$sync_pid" 2>/dev/null || true
 }
+
+# Per-worker thread cap so that BLENDER_PER_GPU workers don't oversubscribe.
+if (( CPU_QUOTA > 0 )); then
+    PER_WORKER_CPU=$(( CPU_QUOTA / TOTAL_PER_POD ))
+    (( PER_WORKER_CPU < 1 )) && PER_WORKER_CPU=1
+else
+    PER_WORKER_CPU=0
+fi
+echo "  per-worker CPU cap = $PER_WORKER_CPU (OMP/MKL/x265 threads inside each worker)"
+echo "================================================================"
 
 # Launch one supervisor per worker.
 for i in $(seq 0 $((TOTAL_PER_POD - 1))); do
@@ -180,7 +234,16 @@ for i in $(seq 0 $((TOTAL_PER_POD - 1))); do
     LOCAL_PROC=$((i % BLENDER_PER_GPU))
     RANK=$((SUB_RANK_BASE + i))
     TAG="g${GPU}_p${LOCAL_PROC}"
-    worker_supervisor "$RANK" "$GPU" "$TAG" &
+    if (( PER_WORKER_CPU > 0 )); then
+        OMP_NUM_THREADS=$PER_WORKER_CPU \
+        MKL_NUM_THREADS=$PER_WORKER_CPU \
+        OPENBLAS_NUM_THREADS=$PER_WORKER_CPU \
+        NUMEXPR_NUM_THREADS=$PER_WORKER_CPU \
+        BLENDER_NUM_THREADS=$PER_WORKER_CPU \
+        worker_supervisor "$RANK" "$GPU" "$TAG" &
+    else
+        worker_supervisor "$RANK" "$GPU" "$TAG" &
+    fi
     WORKER_PIDS+=("$!")
     sleep 1
 done

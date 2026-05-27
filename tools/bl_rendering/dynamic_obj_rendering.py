@@ -196,7 +196,17 @@ def write_16bit_depth_video_streaming_from_pngs(image_paths: List[str], save_pat
     stream.width = int(width)
     stream.height = int(height)
     stream.pix_fmt = "yuv420p10le"
-    stream.options = {"crf": "10"}
+    # Respect cgroup CPU quota: x265 otherwise spawns threads based on host nproc.
+    # BLENDER_NUM_THREADS is exported by shs/render_dynamic_obj_mp.sh as
+    # (cgroup_cpu_quota / workers_per_pod). Fall back to a small constant in
+    # standalone runs.
+    _enc_threads = int(os.environ.get("BLENDER_NUM_THREADS", "0")) or 4
+    stream.options = {"crf": "10", "threads": str(_enc_threads)}
+    try:
+        stream.thread_count = int(_enc_threads)
+        stream.thread_type = "FRAME"
+    except Exception:
+        pass
 
     def encode_one_frame(chw: np.ndarray):
         hwc = np.transpose(chw, (1, 2, 0))
@@ -371,6 +381,12 @@ def get_camera_intrinsics_dict(cam_obj, resolution: int):
 
 
 def extract_merged_mesh_world_fast(mesh_objs, depsgraph=None):
+    """Extract (vertices, faces) for the current frame. Triangulation is
+    re-derived from loop_triangles; only safe to call on the reference frame
+    because Blender's evaluated-mesh triangulation is not guaranteed to be
+    deterministic across frames (e.g. armature deform can flip the quad
+    diagonal of an isolated triangle).
+    """
     if depsgraph is None:
         depsgraph = bpy.context.evaluated_depsgraph_get()
 
@@ -413,6 +429,44 @@ def extract_merged_mesh_world_fast(mesh_objs, depsgraph=None):
     merged_vertices = np.concatenate(all_vertices, axis=0)
     merged_faces = np.concatenate(all_faces, axis=0)
     return merged_vertices.astype(np.float32, copy=False), merged_faces.astype(np.int32, copy=False)
+
+
+def extract_merged_vertices_world_fast(mesh_objs, depsgraph=None):
+    """Extract only world-space vertices for the current frame, in the SAME
+    object/vertex order as the reference call to extract_merged_mesh_world_fast.
+    This skips loop_triangle recomputation, which is both faster and avoids
+    the per-frame triangulation drift Blender exhibits on armature-driven
+    quads (see Topology-changed bug in fd4d).
+    """
+    if depsgraph is None:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+
+    all_vertices = []
+    for obj in mesh_objs:
+        if obj.type != "MESH":
+            continue
+        obj_eval = obj.evaluated_get(depsgraph)
+        temp_mesh = obj_eval.to_mesh()
+        if temp_mesh is None:
+            continue
+        try:
+            num_verts = len(temp_mesh.vertices)
+            if num_verts == 0:
+                continue
+            co = np.empty(num_verts * 3, dtype=np.float32)
+            temp_mesh.vertices.foreach_get("co", co)
+            co = co.reshape(num_verts, 3)
+            world_mat = obj_eval.matrix_world.copy()
+            R = np.array(world_mat.to_3x3(), dtype=np.float32)
+            t = np.array(world_mat.translation[:], dtype=np.float32)
+            verts_world = co @ R.T + t[None, :]
+            all_vertices.append(verts_world)
+        finally:
+            obj_eval.to_mesh_clear()
+
+    if len(all_vertices) == 0:
+        raise RuntimeError("No valid mesh found in current frame.")
+    return np.concatenate(all_vertices, axis=0).astype(np.float32, copy=False)
 
 
 def collect_keyframe_frames(frame_start: int, frame_end: int) -> List[int]:
@@ -481,9 +535,9 @@ def compute_sequence_normalization_params_and_cache(
     raw_cache_dtype=np.float16,
 ):
     scene = bpy.context.scene
-    depsgraph = bpy.context.evaluated_depsgraph_get()
 
     shared_faces = None
+    ref_vert_count = None
     raw_vertices_cache = [] if cache_raw_vertices else None
 
     global_min = np.array([np.inf, np.inf, np.inf], dtype=np.float32)
@@ -492,19 +546,27 @@ def compute_sequence_normalization_params_and_cache(
     for i in frame_indices:
         scene.frame_set(int(i))
         bpy.context.view_layer.update()
-        raw_vertices, raw_faces = extract_merged_mesh_world_fast(mesh_objs, depsgraph=depsgraph)
+        depsgraph = bpy.context.evaluated_depsgraph_get()
 
         if shared_faces is None:
+            # First frame: also extract triangulation as the reference topology.
+            raw_vertices, raw_faces = extract_merged_mesh_world_fast(mesh_objs, depsgraph=depsgraph)
             shared_faces = raw_faces.copy()
+            ref_vert_count = int(raw_vertices.shape[0])
             print(
                 f"Reference topology set from frame {int(i)}: "
-                f"{shared_faces.shape[0]} faces, {raw_vertices.shape[0]} vertices"
+                f"{shared_faces.shape[0]} faces, {ref_vert_count} vertices"
             )
         else:
-            if raw_faces.shape != shared_faces.shape or not np.array_equal(raw_faces, shared_faces):
+            # Subsequent frames: only re-extract vertices; reuse shared_faces.
+            # Blender's evaluated-mesh triangulation can drift between frames
+            # (armature deform flipping quad diagonals), so we never recompute
+            # it here. Only the per-object vertex count must stay constant.
+            raw_vertices = extract_merged_vertices_world_fast(mesh_objs, depsgraph=depsgraph)
+            if raw_vertices.shape[0] != ref_vert_count:
                 raise RuntimeError(
-                    f"Topology changed at frame {int(i)}. "
-                    f"Reference faces shape={shared_faces.shape}, current faces shape={raw_faces.shape}."
+                    f"Vertex count changed at frame {int(i)}: "
+                    f"reference={ref_vert_count}, current={raw_vertices.shape[0]}."
                 )
 
         frame_min = raw_vertices.min(axis=0)

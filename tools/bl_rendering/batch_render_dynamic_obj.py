@@ -98,7 +98,8 @@ def s3_exists_file(s3_uri: str) -> bool:
 class ProgressStore:
     """Per-rank progress JSON + append-only status log, mirrored to S3."""
 
-    def __init__(self, s3_output_root: str, rank: int, local_state_dir: str):
+    def __init__(self, s3_output_root: str, rank: int, local_state_dir: str,
+                 push_every_updates: int = 8, push_min_interval_s: float = 30.0):
         os.makedirs(local_state_dir, exist_ok=True)
         self.rank = int(rank)
         self.s3_logs_root = s3_output_root.rstrip("/") + "/logs"
@@ -107,6 +108,11 @@ class ProgressStore:
         self.local_progress = os.path.join(local_state_dir, f"progress_{rank}.json")
         self.local_status = os.path.join(local_state_dir, f"status_{rank}.log")
         self.progress: dict = {}
+        # S3 push throttling: avoid 1 put per view (8 PUTs per obj * 1000s obj).
+        self.push_every_updates = max(1, int(push_every_updates))
+        self.push_min_interval_s = float(push_min_interval_s)
+        self._updates_since_push = 0
+        self._last_push_ts = 0.0
 
     def load(self):
         # Try to pull progress + status from S3 (best-effort).
@@ -147,14 +153,36 @@ class ProgressStore:
         with open(self.local_status, "a") as f:
             f.write(line.rstrip("\n") + "\n")
 
-    def update_view(self, sha256: str, view_idx: int, entry: dict, status_line: str):
+    def update_view(self, sha256: str, view_idx: int, entry: dict, status_line: str,
+                    force_push: bool = False):
         key = self.view_key(sha256, view_idx)
         self.progress[key] = entry
         self._save_progress_local()
         self._append_status_local(status_line)
-        # Push to S3 (best-effort; failure is logged but not fatal).
+        # Push to S3 with throttling: status log is append-only and cheap to
+        # re-upload, but progress.json grows linearly. Push when either
+        # (a) force_push (e.g. obj-level boundary), (b) we've accumulated
+        # `push_every_updates` updates, or (c) `push_min_interval_s` has
+        # elapsed since the last push.
+        self._updates_since_push += 1
+        now = time.time()
+        should_push = (
+            force_push
+            or self._updates_since_push >= self.push_every_updates
+            or (now - self._last_push_ts) >= self.push_min_interval_s
+        )
+        if should_push:
+            s3_cp_file(self.local_progress, self.s3_progress_uri, retries=1)
+            s3_cp_file(self.local_status, self.s3_status_uri, retries=1)
+            self._updates_since_push = 0
+            self._last_push_ts = now
+
+    def flush(self):
+        """Force-push current progress + status to S3 (e.g. on shutdown)."""
         s3_cp_file(self.local_progress, self.s3_progress_uri, retries=1)
         s3_cp_file(self.local_status, self.s3_status_uri, retries=1)
+        self._updates_since_push = 0
+        self._last_push_ts = time.time()
 
 
 # =====================================================================================
@@ -476,6 +504,10 @@ def main():
             shutil.rmtree(tmp_extract_dir, ignore_errors=True)
             shutil.rmtree(local_obj_dir, ignore_errors=True)
 
+        # Force-flush progress + status to S3 at the obj boundary so the
+        # per-view throttling never hides a fully-completed obj.
+        progress.flush()
+
         if (i + 1) % args.heartbeat_every_objs == 0:
             push_heartbeat(i + 1, len(manifest), status="running",
                            success=success_obj, skip=skip_obj, fail=fail_obj)
@@ -483,6 +515,7 @@ def main():
         if (i + 1) % 10 == 0:
             print(f"{tag} [{i+1}/{len(manifest)}] success={success_obj} skip={skip_obj} fail={fail_obj}")
 
+    progress.flush()
     push_heartbeat(len(manifest), len(manifest), status="done",
                    success=success_obj, skip=skip_obj, fail=fail_obj)
     print(f"\n{tag} DONE. success={success_obj} skip={skip_obj} fail={fail_obj} total={len(manifest)}")
