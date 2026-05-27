@@ -2,22 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-dynamic_obj_rendering.py
+dynamic_obj_rendering_v2.py
 
-Renders animated 3D files (FBX/GLB/GLTF/DAE/OBJ) using Blender.
-Based on 4D_video_data.py with the following changes:
-1. Added FBX/DAE import support.
-2. Removed motion trimming (umeyama) - uses full animation range.
-3. If >121 frames, takes the center 121 frames.
-4. Simplified for batch processing.
+Frame-major (inverted) variant of dynamic_obj_rendering.py.
 
-Usage (called by Blender):
-    blender --background --python dynamic_obj_rendering.py -- \
-        --object_path /path/to/file.fbx \
-        --output_file /path/to/output/result.json \
-        --hdr_dir /path/to/hdr \
-        --render_engine CYCLES \
-        --transparent_bg
+Key differences vs v1:
+- Outer loop iterates frames, inner loop iterates views, so each frame's mesh
+  is uploaded / BVH-built only once per obj instead of once per view.
+- All views in an obj are rendered as a single unit (obj-level resume only).
+- Output layout:
+    <obj_root>/
+        mesh.npz                   # single shared geometry for the whole obj
+        result.json                # single obj-level metadata, "views" sub-dict
+        result_rgb_mp4/
+            view_00.mp4
+            view_02.mp4
+            ...
+- Emits a single [OBJ_DONE] marker on stdout when finished (success or error).
+- Normal-map rendering is intentionally not supported in v2.
 """
 
 import argparse
@@ -28,14 +30,12 @@ import re
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List
 
 import bpy
 import numpy as np
-from bpy_extras.object_utils import world_to_camera_view
-from mathutils import Matrix, Vector
+from mathutils import Matrix
 
 try:
     import av
@@ -44,7 +44,7 @@ except Exception:
 
 
 # =====================================================================================
-# 0. UTILS / TIMING / DEBUG
+# 0. UTILS / TIMING
 # =====================================================================================
 
 
@@ -114,35 +114,6 @@ def get_render_view_indices(num_cameras: int, camera_stride: int) -> List[int]:
     return view_indices
 
 
-def all_view_mp4_exist(video_dir: str, view_indices: List[int]) -> bool:
-    video_dir = Path(video_dir)
-    if not video_dir.is_dir():
-        return False
-    for view_idx in view_indices:
-        mp4_path = video_dir / f"view_{view_idx:02d}.mp4"
-        if not mp4_path.is_file():
-            return False
-    return True
-
-
-def view_dir_for(obj_root: str, view_idx: int) -> str:
-    return os.path.join(obj_root, f"view_{view_idx:02d}")
-
-
-def view_outputs_complete(obj_root: str, view_idx: int, need_normal: bool) -> bool:
-    """Check whether a view's local outputs are all present."""
-    vd = view_dir_for(obj_root, view_idx)
-    if not os.path.isfile(os.path.join(vd, "result.json")):
-        return False
-    if not os.path.isfile(os.path.join(vd, "mesh.npz")):
-        return False
-    if not os.path.isfile(os.path.join(vd, "rgb.mp4")):
-        return False
-    if need_normal and not os.path.isfile(os.path.join(vd, "normal.mp4")):
-        return False
-    return True
-
-
 def list_png_files_natural(view_dir: str) -> List[str]:
     view_dir = Path(view_dir)
     if not view_dir.is_dir():
@@ -153,33 +124,31 @@ def list_png_files_natural(view_dir: str) -> List[str]:
 
 
 def load_png_as_float01_chw_with_blender(image_path: str) -> np.ndarray:
-    """Load PNG (8-bit or 16-bit) as float01 CHW with PIL.
-    Uses PIL (not bpy.data.images) because bpy is not thread-safe and the
-    encode pool runs in background threads concurrently with Blender's main
-    render loop.
-    """
-    from PIL import Image  # local import keeps top-level cheap
-    with Image.open(image_path) as img:
-        mode = img.mode
-        arr = np.asarray(img)
-    if arr.ndim == 2:
-        arr = arr[:, :, None]
-        arr = np.repeat(arr, 3, axis=2)
-    if arr.shape[2] >= 3:
-        rgb = arr[:, :, :3]
-    else:
-        rgb = np.repeat(arr[:, :, :1], 3, axis=2)
-    if rgb.dtype == np.uint8:
-        rgb = rgb.astype(np.float32) / 255.0
-    elif rgb.dtype == np.uint16:
-        rgb = rgb.astype(np.float32) / 65535.0
-    else:
-        rgb = rgb.astype(np.float32)
-    rgb = np.clip(rgb, 0.0, 1.0)
-    return np.transpose(rgb, (2, 0, 1)).astype(np.float32, copy=False)
+    img = bpy.data.images.load(image_path, check_existing=False)
+    try:
+        width = int(img.size[0])
+        height = int(img.size[1])
+        channels = int(img.channels)
+        pixels = np.array(img.pixels[:], dtype=np.float32)
+        if width <= 0 or height <= 0:
+            raise RuntimeError(f"Invalid image size for {image_path}: {(width, height)}")
+        pixels = pixels.reshape(height, width, channels)
+        pixels = pixels[::-1, :, :]
+        if channels >= 3:
+            rgb = pixels[:, :, :3]
+        else:
+            rgb = np.repeat(pixels[:, :, :1], 3, axis=2)
+        rgb = np.clip(rgb, 0.0, 1.0)
+        chw = np.transpose(rgb, (2, 0, 1)).astype(np.float32, copy=False)
+        return chw
+    finally:
+        try:
+            bpy.data.images.remove(img)
+        except Exception:
+            pass
 
 
-def write_16bit_depth_video_streaming_from_pngs(image_paths: List[str], save_path: str, fps=24, modal="rgb"):
+def write_rgb_video_streaming_from_pngs(image_paths: List[str], save_path: str, fps: int = 24):
     ensure_pyav_available()
     if len(image_paths) == 0:
         raise RuntimeError(f"No PNG frames found for video export: {save_path}")
@@ -200,14 +169,8 @@ def write_16bit_depth_video_streaming_from_pngs(image_paths: List[str], save_pat
 
     def encode_one_frame(chw: np.ndarray):
         hwc = np.transpose(chw, (1, 2, 0))
-        if modal == "rgb":
-            frame = np.clip(hwc * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
-            yuv_frame = av.VideoFrame.from_ndarray(frame, format="rgb24").reformat(format="yuv420p10le")
-        elif modal == "normal":
-            frame = np.clip(hwc * 65535.0 + 0.5, 0.0, 65535.0).astype(np.uint16)
-            yuv_frame = av.VideoFrame.from_ndarray(frame, format="rgb48le").reformat(format="yuv420p10le")
-        else:
-            raise ValueError(f"Unsupported modal for PNG sequence export: {modal}")
+        frame = np.clip(hwc * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
+        yuv_frame = av.VideoFrame.from_ndarray(frame, format="rgb24").reformat(format="yuv420p10le")
         for packet in stream.encode(yuv_frame):
             output.mux(packet)
 
@@ -234,13 +197,12 @@ def write_16bit_depth_video_streaming_from_pngs(image_paths: List[str], save_pat
         output.close()
 
 
-def encode_view_pngs_to_mp4(png_dir: str, mp4_path: str, fps: int, modal: str):
-    """Encode all PNGs in `png_dir` (natural-sorted) into a single mp4."""
+def encode_view_pngs_to_mp4(png_dir: str, mp4_path: str, fps: int):
     pngs = list_png_files_natural(png_dir)
     if len(pngs) == 0:
         raise RuntimeError(f"No PNG frames to encode in {png_dir}")
-    print(f"[video] Encoding {modal} mp4: {len(pngs)} frames -> {mp4_path}")
-    write_16bit_depth_video_streaming_from_pngs(pngs, mp4_path, fps=fps, modal=modal)
+    print(f"[video] Encoding rgb mp4: {len(pngs)} frames -> {mp4_path}")
+    write_rgb_video_streaming_from_pngs(pngs, mp4_path, fps=fps)
 
 
 # =====================================================================================
@@ -332,18 +294,6 @@ def set_camera_from_cam2world(cam_obj, cam2world: np.ndarray):
     cam_obj.matrix_world = Matrix(cam2world.tolist())
 
 
-def set_camera_intrinsics_from_fov(cam_obj, fov_deg: float, sensor_size: float = 36.0):
-    fov_deg = float(np.clip(fov_deg, 1.0, 179.0))
-    fov_rad = math.radians(fov_deg)
-    cam_data = cam_obj.data
-    cam_data.type = "PERSP"
-    cam_data.sensor_fit = "HORIZONTAL"
-    cam_data.sensor_width = float(sensor_size)
-    cam_data.sensor_height = float(sensor_size)
-    lens_mm = 0.5 * float(sensor_size) / max(math.tan(0.5 * fov_rad), 1e-8)
-    cam_data.lens = float(lens_mm)
-
-
 def get_camera_intrinsics_dict(cam_obj, resolution: int):
     cam_data = cam_obj.data
     angle_x = float(cam_data.angle_x)
@@ -413,42 +363,6 @@ def extract_merged_mesh_world_fast(mesh_objs, depsgraph=None):
     merged_vertices = np.concatenate(all_vertices, axis=0)
     merged_faces = np.concatenate(all_faces, axis=0)
     return merged_vertices.astype(np.float32, copy=False), merged_faces.astype(np.int32, copy=False)
-
-
-def collect_keyframe_frames(frame_start: int, frame_end: int) -> List[int]:
-    keyframes = set()
-    for action in bpy.data.actions:
-        for fcurve in action.fcurves:
-            for kp in fcurve.keyframe_points:
-                frame = int(round(float(kp.co.x)))
-                if frame_start <= frame <= frame_end:
-                    keyframes.add(frame)
-    return sorted(keyframes)
-
-
-def save_mesh_as_ply(vertices: np.ndarray, faces: np.ndarray, ply_path: str):
-    vertices = np.asarray(vertices, dtype=np.float32)
-    faces = np.asarray(faces, dtype=np.int32)
-    os.makedirs(os.path.dirname(ply_path) or ".", exist_ok=True)
-    header = (
-        "ply\n"
-        "format binary_little_endian 1.0\n"
-        f"element vertex {len(vertices)}\n"
-        "property float x\n"
-        "property float y\n"
-        "property float z\n"
-        f"element face {len(faces)}\n"
-        "property list uchar int vertex_indices\n"
-        "end_header\n"
-    )
-    with open(ply_path, "wb") as f:
-        f.write(header.encode("ascii"))
-        vertices.astype("<f4", copy=False).tofile(f)
-        face_dtype = np.dtype([("count", "u1"), ("idx", "<i4", (3,))])
-        face_data = np.empty(len(faces), dtype=face_dtype)
-        face_data["count"] = 3
-        face_data["idx"] = faces.astype("<i4", copy=False)
-        face_data.tofile(f)
 
 
 # =====================================================================================
@@ -543,8 +457,6 @@ def precompute_normalized_mesh_sequence_from_cache(
     raw_vertices_cache: List[np.ndarray],
     global_center: np.ndarray,
     global_scale: float,
-    shared_faces: np.ndarray,
-    frame_indices: np.ndarray,
 ):
     if raw_vertices_cache is None:
         raise RuntimeError("raw_vertices_cache is None.")
@@ -609,9 +521,9 @@ def enable_cycles_device(device: str = "GPU", backend: str = "CUDA"):
 
 def setup_renderer(
     resolution=512,
-    engine="BLENDER_EEVEE",
+    engine="CYCLES",
     transparent_bg=True,
-    cycles_samples: int = 64,
+    cycles_samples: int = 256,
     cycles_use_denoising: bool = False,
     cycles_device: str = "GPU",
 ):
@@ -643,7 +555,6 @@ def setup_renderer(
 
 
 def _ensure_world_node_tree():
-    """Ensure scene.world exists with nodes enabled; clear nodes and return (world, nodes, links)."""
     scene = bpy.context.scene
     if scene.world is None:
         world = bpy.data.worlds.new("World")
@@ -660,17 +571,14 @@ def _ensure_world_node_tree():
 
 
 def _delete_all_lights():
-    """Delete every LIGHT object currently in the scene."""
     bpy.ops.object.select_all(action="DESELECT")
     bpy.ops.object.select_by_type(type="LIGHT")
     bpy.ops.object.delete()
 
 
 def init_uniform_lighting():
-    """Pure white environment background (used once at scene init)."""
     _delete_all_lights()
     _, nodes, links = _ensure_world_node_tree()
-
     bg_node = nodes.new(type="ShaderNodeBackground")
     bg_node.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
     bg_node.inputs["Strength"].default_value = 1.0
@@ -678,25 +586,17 @@ def init_uniform_lighting():
     links.new(bg_node.outputs["Background"], output_node.inputs["Surface"])
 
 
-def init_random_lighting(camera_dir: np.ndarray, rng: np.random.Generator) -> dict:
-    """Per-view lighting: 1-3 random POINT lights with energy balanced against camera direction,
-    plus a residual white environment background. Mirrors data_toolkit/blender_script/render_cond.py.
-
-    Returns a metadata dict describing the sampled lights for the output JSON.
+def sample_view_lighting_config(camera_dir: np.ndarray, rng: np.random.Generator) -> dict:
+    """Pre-compute (without touching the scene) the lighting config for one view,
+    matching the random-point-lights distribution used in v1.
+    Returns a dict with keys: lights (list of {location, energy, shadow_soft_size}),
+    bg_strength, num_lights, lighting_type.
     """
-    _delete_all_lights()
-    _, nodes, links = _ensure_world_node_tree()
-
-    num_lights = int(rng.integers(low=1, high=4))  # 1, 2, or 3 (high is exclusive)
+    num_lights = int(rng.integers(low=1, high=4))
     total_strength = 1.5
-    lights_meta = []
+    lights = []
     cam_dir_np = np.asarray(camera_dir, dtype=np.float64)
-    for i in range(num_lights):
-        new_light = bpy.data.objects.new(
-            f"Light_{i}", bpy.data.lights.new(f"Light_{i}", type="POINT")
-        )
-        bpy.context.collection.objects.link(new_light)
-
+    for _ in range(num_lights):
         new_light_distance = 1.0 / float(rng.uniform(1.0 / 100.0, 1.0 / 10.0))
         new_light_dir = rng.standard_normal(3)
         new_light_dir[2] += 0.6
@@ -709,103 +609,52 @@ def init_random_lighting(camera_dir: np.ndarray, rng: np.random.Generator) -> di
         new_light_camera_strength = new_light_camera_strength_ratio * new_light_strength
         total_strength -= new_light_camera_strength
 
-        new_light.location = (
-            float(new_light_location[0]),
-            float(new_light_location[1]),
-            float(new_light_location[2]),
-        )
-        new_light.data.color = (1.0, 1.0, 1.0)
-        new_light.data.energy = float(new_light_strength * new_light_distance ** 2 * 31.4)
-        new_light.data.shadow_soft_size = float(rng.uniform(0.1, 0.1 * new_light_distance))
+        energy = float(new_light_strength * new_light_distance ** 2 * 31.4)
+        shadow_soft_size = float(rng.uniform(0.1, 0.1 * new_light_distance))
 
-        lights_meta.append({
+        lights.append({
             "location": [float(x) for x in new_light_location],
             "distance": float(new_light_distance),
-            "energy": float(new_light.data.energy),
-            "shadow_soft_size": float(new_light.data.shadow_soft_size),
+            "energy": energy,
+            "shadow_soft_size": shadow_soft_size,
         })
 
     bg_strength = float(max(total_strength, 0.0))
-    bg_node = nodes.new(type="ShaderNodeBackground")
-    bg_node.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-    bg_node.inputs["Strength"].default_value = bg_strength
-    output_node = nodes.new(type="ShaderNodeOutputWorld")
-    links.new(bg_node.outputs["Background"], output_node.inputs["Surface"])
-
     return {
         "lighting_type": "random_point_lights",
         "num_lights": int(num_lights),
         "bg_strength": bg_strength,
-        "lights": lights_meta,
+        "lights": lights,
     }
+
+
+def apply_view_lighting(lighting_cfg: dict):
+    """Tear down current lights and instantiate the lighting described by `lighting_cfg`."""
+    _delete_all_lights()
+    _, nodes, links = _ensure_world_node_tree()
+
+    for i, light in enumerate(lighting_cfg["lights"]):
+        new_light = bpy.data.objects.new(
+            f"Light_{i}", bpy.data.lights.new(f"Light_{i}", type="POINT")
+        )
+        bpy.context.collection.objects.link(new_light)
+        loc = light["location"]
+        new_light.location = (float(loc[0]), float(loc[1]), float(loc[2]))
+        new_light.data.color = (1.0, 1.0, 1.0)
+        new_light.data.energy = float(light["energy"])
+        new_light.data.shadow_soft_size = float(light["shadow_soft_size"])
+
+    bg_node = nodes.new(type="ShaderNodeBackground")
+    bg_node.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    bg_node.inputs["Strength"].default_value = float(lighting_cfg["bg_strength"])
+    output_node = nodes.new(type="ShaderNodeOutputWorld")
+    links.new(bg_node.outputs["Background"], output_node.inputs["Surface"])
 
 
 def render_frame(output_path: str):
     scene = bpy.context.scene
     scene.render.filepath = output_path
     bpy.ops.render.render(write_still=True)
-
-
-def setup_normal_output(normal_root_dir: str):
-    scene = bpy.context.scene
-    view_layer = bpy.context.view_layer
-    view_layer.use_pass_normal = True
-
-    scene.use_nodes = True
-    if hasattr(scene.render, "use_compositing"):
-        scene.render.use_compositing = True
-
-    tree = scene.node_tree
-    nodes = tree.nodes
-    links = tree.links
-    nodes.clear()
-
-    rlayers = nodes.new(type="CompositorNodeRLayers")
-    rlayers.location = (-500, 0)
-
-    composite = nodes.new(type="CompositorNodeComposite")
-    composite.location = (350, 120)
-    links.new(rlayers.outputs["Image"], composite.inputs["Image"])
-
-    normal_mul = nodes.new(type="CompositorNodeMixRGB")
-    normal_mul.blend_type = "MULTIPLY"
-    normal_mul.inputs[0].default_value = 1.0
-    normal_mul.inputs[2].default_value = (0.5, 0.5, 0.5, 1.0)
-    normal_mul.location = (-150, -80)
-    links.new(rlayers.outputs["Normal"], normal_mul.inputs[1])
-
-    normal_add = nodes.new(type="CompositorNodeMixRGB")
-    normal_add.blend_type = "ADD"
-    normal_add.inputs[0].default_value = 1.0
-    normal_add.inputs[2].default_value = (0.5, 0.5, 0.5, 0.0)
-    normal_add.location = (80, -80)
-    links.new(normal_mul.outputs["Image"], normal_add.inputs[1])
-
-    set_alpha = nodes.new(type="CompositorNodeSetAlpha")
-    set_alpha.location = (300, -80)
-    links.new(normal_add.outputs["Image"], set_alpha.inputs["Image"])
-    links.new(rlayers.outputs["Alpha"], set_alpha.inputs["Alpha"])
-
-    file_output = nodes.new(type="CompositorNodeOutputFile")
-    file_output.location = (550, -80)
-    file_output.base_path = normal_root_dir
-    slot = file_output.file_slots[0]
-    slot.path = "frame_"
-    slot.use_node_format = True
-    slot.save_as_render = False
-
-    file_output.format.file_format = "PNG"
-    file_output.format.color_mode = "RGBA"
-    file_output.format.color_depth = "16"
-
-    links.new(set_alpha.outputs["Image"], file_output.inputs[0])
-    return file_output
-
-
-def update_normal_output_path(file_output_node, base_dir: str, prefix: str):
-    os.makedirs(base_dir, exist_ok=True)
-    file_output_node.base_path = base_dir
-    file_output_node.file_slots[0].path = prefix
 
 
 # =====================================================================================
@@ -925,7 +774,7 @@ def create_static_multiview_cameras(
             normalized_vertices_seq, rot_world_to_cam_aligned=rot_world_to_cam_aligned,
         )
 
-        view_specific_scale, camera_space_extent = compute_bbox_unit_normalization_scale(camera_space_bbox_min, camera_space_bbox_max)
+        view_specific_scale, _ = compute_bbox_unit_normalization_scale(camera_space_bbox_min, camera_space_bbox_max)
         normalized_camera_space_bbox_min = (camera_space_bbox_min * view_specific_scale).astype(np.float32)
         normalized_camera_space_bbox_max = (camera_space_bbox_max * view_specific_scale).astype(np.float32)
 
@@ -960,24 +809,26 @@ def create_static_multiview_cameras(
 
 
 # =====================================================================================
-# 6. CORE WORKER
+# 6. CORE WORKER (frame-major)
 # =====================================================================================
 
 
-def emit_view_done(sha256: str, view_idx: int, status: str, **extra):
+def emit_obj_done(sha256: str, status: str, **extra):
     """Emit a single-line marker to stdout for the batch layer to parse."""
-    payload = {"sha256": sha256, "view_index": int(view_idx), "status": status}
+    payload = {"sha256": sha256, "status": status}
     payload.update(extra)
-    print("[VIEW_DONE] " + json.dumps(payload, ensure_ascii=False), flush=True)
+    print("[OBJ_DONE] " + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def process_geometry(args):
     timer = StageTimer()
-    print("--- Starting Dynamic OBJ Rendering ---")
+    print("--- Starting Dynamic OBJ Rendering (v2, frame-major) ---")
 
     sha256 = args.sha256
-    obj_root = args.obj_root  # local dir for this obj's outputs
+    obj_root = args.obj_root
     os.makedirs(obj_root, exist_ok=True)
+    rgb_mp4_dir = os.path.join(obj_root, "result_rgb_mp4")
+    os.makedirs(rgb_mp4_dir, exist_ok=True)
 
     all_view_indices = get_render_view_indices(args.num_cameras, args.camera_stride)
     print(f"All view indices = {all_view_indices}")
@@ -1015,12 +866,6 @@ def process_geometry(args):
         cycles_use_denoising=args.cycles_use_denoising,
         cycles_device=args.cycles_device,
     )
-
-    # Compositor output for normals (re-routed per view in the render loop).
-    normal_output_node = None
-    if args.render_normal_map:
-        # Use obj_root as a placeholder base; we will override per view.
-        normal_output_node = setup_normal_output(obj_root)
     timer.log("renderer setup")
 
     mesh_objs = []
@@ -1036,7 +881,6 @@ def process_geometry(args):
         raise RuntimeError("No mesh objects found after loading.")
     print(f"Found {len(mesh_objs)} mesh objects")
 
-    # Resolve animation frame range
     actions = bpy.data.actions
     raw_frame_start, raw_frame_end = (bpy.context.scene.frame_start, bpy.context.scene.frame_end)
     if actions:
@@ -1053,7 +897,6 @@ def process_geometry(args):
         frame_indices = frame_indices[crop_start : crop_start + MAX_FRAMES]
         print(f"Center-cropped to {MAX_FRAMES} frames: [{int(frame_indices[0])}, {int(frame_indices[-1])}]")
 
-    # First pass: topology check + normalization
     (
         shared_faces,
         global_center,
@@ -1071,12 +914,9 @@ def process_geometry(args):
         raw_vertices_cache=raw_vertices_cache,
         global_center=global_center,
         global_scale=sequence_scale,
-        shared_faces=shared_faces,
-        frame_indices=frame_indices,
     )
     timer.log("normalize cached mesh sequence")
 
-    # Cameras: deterministic for the WHOLE obj (use num_cameras so all_view ids match across resumes).
     camera_seed = int(args.traj_seed + args.traj_id * 9973)
     camera_objs, camera_infos = create_static_multiview_cameras(
         num_cameras=args.num_cameras,
@@ -1092,15 +932,105 @@ def process_geometry(args):
     )
     timer.log("create static cameras")
 
-    # Lighting: uniform white env once; sample random POINT lights deterministically per view.
-    init_uniform_lighting()
+    # Pre-sample lighting per view (deterministic). The scene's actual lights
+    # are swapped in the inner view loop via apply_view_lighting().
+    lighting_seed_base = int(args.traj_seed + args.traj_id * 10007 + 424242)
+    init_uniform_lighting()  # bootstrap, replaced before the first frame anyway
+    view_lighting_cfgs: Dict[int, dict] = {}
+    for view_idx in render_view_indices:
+        view_lighting_rng = np.random.default_rng(lighting_seed_base + int(view_idx))
+        cam_pos_np = np.asarray(camera_infos[view_idx]["camera_pos"], dtype=np.float64)
+        cam_pos_norm = float(np.linalg.norm(cam_pos_np))
+        cam_dir_np = cam_pos_np / cam_pos_norm if cam_pos_norm > 1e-8 else np.array([0.0, 0.0, 1.0])
+        cfg = sample_view_lighting_config(cam_dir_np, view_lighting_rng)
+        cfg["view_index"] = int(view_idx)
+        view_lighting_cfgs[int(view_idx)] = cfg
     bpy.context.scene.camera = camera_objs[render_view_indices[0]]
-    timer.log("lighting setup")
+    timer.log("lighting precompute")
 
-    # Common object-level metadata, baked into every per-view result.json.
-    common_meta = {
-        "object_path": args.object_path,
+    # Per-view scratch dirs for PNGs.
+    view_png_dirs: Dict[int, str] = {}
+    for view_idx in render_view_indices:
+        d = os.path.join(obj_root, f"_png_view_{view_idx:02d}")
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+        view_png_dirs[int(view_idx)] = d
+
+    # ============================ Frame-major render loop ============================
+    render_stage_t0 = time.perf_counter()
+    sync_total = 0.0
+    render_total = 0.0
+    num_frames = len(frame_indices)
+    num_views = len(render_view_indices)
+
+    try:
+        for local_frame_idx, source_frame in enumerate(frame_indices):
+            frame_int = int(source_frame)
+            sync_t0 = time.perf_counter()
+            bpy.context.scene.frame_set(frame_int)
+            apply_sequence_normalization(
+                sequence_normalizer, global_center=global_center, global_scale=sequence_scale,
+            )
+            bpy.context.view_layer.update()
+            sync_total += time.perf_counter() - sync_t0
+
+            for view_idx in render_view_indices:
+                vlt0 = time.perf_counter()
+                apply_view_lighting(view_lighting_cfgs[view_idx])
+                bpy.context.scene.camera = camera_objs[view_idx]
+                # Light/camera swap counts as scene sync, but it should be tiny.
+                sync_total += time.perf_counter() - vlt0
+
+                rt0 = time.perf_counter()
+                rgb_path = os.path.join(view_png_dirs[view_idx], f"frame_{frame_int:04d}.png")
+                render_frame(rgb_path)
+                render_total += time.perf_counter() - rt0
+
+            if (local_frame_idx + 1) % 10 == 0 or local_frame_idx == 0:
+                print(
+                    f"  frame {local_frame_idx + 1}/{num_frames} (#{frame_int}) "
+                    f"sync={sync_total:.1f}s render={render_total:.1f}s"
+                )
+    except Exception:
+        # Clean up scratch PNG dirs on render failure so resume is fresh.
+        for d in view_png_dirs.values():
+            shutil.rmtree(d, ignore_errors=True)
+        raise
+
+    render_loop_t = time.perf_counter() - render_stage_t0
+    print(
+        f"[timing] frame-major loop: {render_loop_t:.3f}s "
+        f"(sync_total={sync_total:.2f}s, render_total={render_total:.2f}s, "
+        f"frames={num_frames}, views={num_views})"
+    )
+    timer.log("render loop")
+
+    # Encode mp4 per view + cleanup.
+    encode_t0 = time.perf_counter()
+    views_meta: Dict[str, dict] = {}
+    for view_idx in render_view_indices:
+        png_dir = view_png_dirs[view_idx]
+        mp4_path = os.path.join(rgb_mp4_dir, f"view_{view_idx:02d}.mp4")
+        encode_view_pngs_to_mp4(png_dir, mp4_path, fps=args.video_fps)
+        shutil.rmtree(png_dir, ignore_errors=True)
+        views_meta[str(int(view_idx))] = {
+            "view_index": int(view_idx),
+            "camera_info": camera_infos[view_idx],
+            "lighting": view_lighting_cfgs[view_idx],
+            "rgb_mp4": f"result_rgb_mp4/view_{view_idx:02d}.mp4",
+        }
+    encode_t = time.perf_counter() - encode_t0
+    print(f"[timing] mp4 encode: {encode_t:.3f}s")
+    timer.log("mp4 encode")
+
+    # Write shared mesh.npz + obj-level result.json.
+    mesh_npz_path = os.path.join(obj_root, "mesh.npz")
+    np.savez(mesh_npz_path, vertices=vertices_seq, faces=shared_faces, frame_indices=frame_indices)
+
+    obj_result = {
         "sha256": sha256,
+        "object_path": args.object_path,
         "num_frames": int(len(frame_indices)),
         "frame_start": int(frame_indices[0]),
         "frame_end": int(frame_indices[-1]),
@@ -1115,194 +1045,28 @@ def process_geometry(args):
         "num_cameras": int(args.num_cameras),
         "camera_stride": int(args.camera_stride),
         "all_view_indices": [int(x) for x in all_view_indices],
+        "rendered_view_indices": [int(x) for x in render_view_indices],
         "resolution": int(args.resolution),
         "render_engine": args.render_engine,
         "video_fps": int(args.video_fps),
+        "render_time_s": float(time.perf_counter() - render_stage_t0),
+        "sync_time_s": float(sync_total),
+        "render_pt_time_s": float(render_total),
+        "encode_time_s": float(encode_t),
+        "mesh_npz": "mesh.npz",
+        "views": views_meta,
+        "status": "success",
     }
+    atomic_write_json(os.path.join(obj_root, "result.json"), obj_result)
+    timer.log("write mesh + result")
 
-    lighting_seed_base = int(args.traj_seed + args.traj_id * 10007 + 424242)
-
-    # ============================ Render per view ============================
-    # Post-processing (mp4 encode + mesh.npz + result.json + emit_view_done) is
-    # offloaded to a background thread pool so it overlaps with rendering of
-    # subsequent views. emit_view_done only fires once that view's post-process
-    # is fully on disk, so the batch layer's S3 upload sees a complete view dir.
-    encode_workers = max(1, int(getattr(args, "encode_workers", 2)))
-    encode_pool = ThreadPoolExecutor(max_workers=encode_workers, thread_name_prefix="encode")
-    encode_futures: List = []
-    encode_blocked_total = 0.0
-    encode_task_total = 0.0
-    render_stage_t0 = time.perf_counter()
-    sync_total = 0.0
-    render_total = 0.0
-
-    def _post_process_view(
-        view_idx: int,
-        view_out_dir: str,
-        view_png_rgb_dir: str,
-        view_png_normal_dir: str,
-        lighting_meta: dict,
-        view_t0: float,
-    ) -> float:
-        view_name = f"view_{view_idx:02d}"
-        bg_t0 = time.perf_counter()
-        try:
-            rgb_mp4_path = os.path.join(view_out_dir, "rgb.mp4")
-            encode_view_pngs_to_mp4(view_png_rgb_dir, rgb_mp4_path, fps=args.video_fps, modal="rgb")
-            shutil.rmtree(view_png_rgb_dir, ignore_errors=True)
-
-            if args.render_normal_map:
-                normal_mp4_path = os.path.join(view_out_dir, "normal.mp4")
-                encode_view_pngs_to_mp4(view_png_normal_dir, normal_mp4_path, fps=args.video_fps, modal="normal")
-                shutil.rmtree(view_png_normal_dir, ignore_errors=True)
-
-            mesh_npz_path = os.path.join(view_out_dir, "mesh.npz")
-            np.savez(mesh_npz_path, vertices=vertices_seq, faces=shared_faces, frame_indices=frame_indices)
-
-            view_result = dict(common_meta)
-            view_result.update({
-                "view_index": int(view_idx),
-                "camera_info": camera_infos[view_idx],
-                "lighting": lighting_meta,
-                "rgb_mp4": "rgb.mp4",
-                "normal_mp4": "normal.mp4" if args.render_normal_map else None,
-                "mesh_npz": "mesh.npz",
-                "render_time_s": float(time.perf_counter() - view_t0),
-                "status": "success",
-            })
-            atomic_write_json(os.path.join(view_out_dir, "result.json"), view_result)
-            emit_view_done(
-                sha256=sha256,
-                view_idx=view_idx,
-                status="success",
-                render_time_s=float(time.perf_counter() - view_t0),
-            )
-        except Exception as e:
-            err_msg = f"{type(e).__name__}: {e}"
-            print(f"[ERROR] view {view_name} post-process failed: {err_msg}")
-            for p in (view_png_rgb_dir, view_png_normal_dir):
-                shutil.rmtree(p, ignore_errors=True)
-            for p in ("rgb.mp4", "normal.mp4", "mesh.npz", "result.json"):
-                fp = os.path.join(view_out_dir, p)
-                if os.path.isfile(fp):
-                    try:
-                        os.remove(fp)
-                    except Exception:
-                        pass
-            emit_view_done(
-                sha256=sha256,
-                view_idx=view_idx,
-                status="error",
-                error=err_msg,
-            )
-        return time.perf_counter() - bg_t0
-
-    try:
-        for view_idx in render_view_indices:
-            view_t0 = time.perf_counter()
-            view_name = f"view_{view_idx:02d}"
-            view_out_dir = view_dir_for(obj_root, view_idx)
-            os.makedirs(view_out_dir, exist_ok=True)
-
-            view_lighting_rng = np.random.default_rng(lighting_seed_base + int(view_idx))
-            cam_pos_np = np.asarray(camera_infos[view_idx]["camera_pos"], dtype=np.float64)
-            cam_pos_norm = float(np.linalg.norm(cam_pos_np))
-            cam_dir_np = cam_pos_np / cam_pos_norm if cam_pos_norm > 1e-8 else np.array([0.0, 0.0, 1.0])
-            lighting_meta = init_random_lighting(cam_dir_np, view_lighting_rng)
-            lighting_meta["view_index"] = int(view_idx)
-
-            bpy.context.scene.camera = camera_objs[view_idx]
-
-            view_png_rgb_dir = os.path.join(view_out_dir, "_png_rgb")
-            view_png_normal_dir = os.path.join(view_out_dir, "_png_normal")
-            os.makedirs(view_png_rgb_dir, exist_ok=True)
-            if args.render_normal_map:
-                os.makedirs(view_png_normal_dir, exist_ok=True)
-                update_normal_output_path(normal_output_node, base_dir=view_png_normal_dir, prefix="frame_")
-
-            try:
-                for local_frame_idx, source_frame in enumerate(frame_indices):
-                    frame_int = int(source_frame)
-                    sync_t0 = time.perf_counter()
-                    bpy.context.scene.frame_set(frame_int)
-                    apply_sequence_normalization(
-                        sequence_normalizer, global_center=global_center, global_scale=sequence_scale,
-                    )
-                    bpy.context.view_layer.update()
-                    sync_total += time.perf_counter() - sync_t0
-
-                    rt0 = time.perf_counter()
-                    rgb_path = os.path.join(view_png_rgb_dir, f"frame_{frame_int:04d}.png")
-                    render_frame(rgb_path)
-                    render_total += time.perf_counter() - rt0
-                    if (local_frame_idx + 1) % 10 == 0 or local_frame_idx == 0:
-                        print(f"  [{view_name}] frame {local_frame_idx + 1}/{len(frame_indices)} (#{frame_int})")
-
-                # Throttle so disk/mem stays bounded if encode falls behind.
-                while sum(1 for f in encode_futures if not f.done()) >= encode_workers:
-                    wt0 = time.perf_counter()
-                    for f in encode_futures:
-                        if not f.done():
-                            try:
-                                f.result()
-                            except Exception as e:
-                                print(f"[ERROR] encode task raised: {e}")
-                            break
-                    encode_blocked_total += time.perf_counter() - wt0
-
-                fut = encode_pool.submit(
-                    _post_process_view,
-                    view_idx,
-                    view_out_dir,
-                    view_png_rgb_dir,
-                    view_png_normal_dir,
-                    lighting_meta,
-                    view_t0,
-                )
-                encode_futures.append(fut)
-                print(f"  [{view_name}] render done in {time.perf_counter() - view_t0:.2f}s, encode queued")
-            except Exception as e:
-                err_msg = f"{type(e).__name__}: {e}"
-                print(f"[ERROR] view {view_name} render failed: {err_msg}")
-                for p in (view_png_rgb_dir, view_png_normal_dir):
-                    shutil.rmtree(p, ignore_errors=True)
-                for p in ("rgb.mp4", "normal.mp4", "mesh.npz", "result.json"):
-                    fp = os.path.join(view_out_dir, p)
-                    if os.path.isfile(fp):
-                        try:
-                            os.remove(fp)
-                        except Exception:
-                            pass
-                emit_view_done(
-                    sha256=sha256,
-                    view_idx=view_idx,
-                    status="error",
-                    error=err_msg,
-                )
-
-        render_only_t = time.perf_counter() - render_stage_t0
-        print(
-            f"[timing] view-major render-only: {render_only_t:.3f}s "
-            f"(sync_total={sync_total:.2f}s, render_total={render_total:.2f}s, "
-            f"encode_blocked={encode_blocked_total:.2f}s, "
-            f"frames={len(frame_indices)}, views={len(render_view_indices)})"
-        )
-        drain_t0 = time.perf_counter()
-        for f in encode_futures:
-            try:
-                encode_task_total += f.result()
-            except Exception as e:
-                print(f"[ERROR] encode task raised: {e}")
-        drain_t = time.perf_counter() - drain_t0
-        loop_t = time.perf_counter() - render_stage_t0
-        print(
-            f"[timing] view-major loop: {loop_t:.3f}s "
-            f"(encode_drain_wait={drain_t:.2f}s, encode_task_total={encode_task_total:.2f}s, "
-            f"encode_workers={encode_workers})"
-        )
-    finally:
-        encode_pool.shutdown(wait=True)
-    timer.log("render all views")
+    emit_obj_done(
+        sha256=sha256,
+        status="success",
+        num_frames=int(len(frame_indices)),
+        num_views=int(num_views),
+        render_time_s=float(time.perf_counter() - render_stage_t0),
+    )
     print("--- Processing Complete ---")
 
 
@@ -1312,16 +1076,16 @@ def process_geometry(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Render animated 3D files with Blender.")
+    parser = argparse.ArgumentParser(description="Render animated 3D files with Blender (frame-major).")
     parser.add_argument("--object_path", type=str, required=True)
     parser.add_argument("--obj_root", type=str, required=True,
-                        help="Local output directory for this obj (contains per-view subdirs).")
+                        help="Local output directory for this obj.")
     parser.add_argument("--sha256", type=str, required=True,
-                        help="Object identifier; emitted in [VIEW_DONE] markers.")
+                        help="Object identifier; emitted in [OBJ_DONE] marker.")
     parser.add_argument("--render_view_indices", type=int, nargs="*", default=None,
                         help="Subset of view indices to render (default: all views).")
 
-    parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--resolution", type=int, default=1024)
     parser.add_argument("--render_engine", type=str, default="CYCLES", choices=["BLENDER_EEVEE", "CYCLES"])
     parser.add_argument("--transparent_bg", action="store_true")
 
@@ -1329,7 +1093,7 @@ if __name__ == "__main__":
     parser.add_argument("--traj_seed", type=int, default=0)
 
     parser.add_argument("--num_cameras", type=int, default=16)
-    parser.add_argument("--camera_stride", type=int, default=1)
+    parser.add_argument("--camera_stride", type=int, default=2)
     parser.add_argument("--camera_elev_min_deg", type=float, default=0.0)
     parser.add_argument("--camera_elev_max_deg", type=float, default=80.0)
     parser.add_argument("--camera_frame_padding", type=float, default=0.03)
@@ -1337,18 +1101,21 @@ if __name__ == "__main__":
     parser.add_argument("--camera_distance_jitter_scale", type=float, default=1.04)
     parser.add_argument("--camera_sensor_size", type=float, default=36.0)
 
-    parser.add_argument("--render_normal_map", dest="render_normal_map", action="store_true")
-    parser.add_argument("--no_render_normal_map", dest="render_normal_map", action="store_false")
-    parser.set_defaults(render_normal_map=True)
-
     parser.add_argument("--cycles_backend", type=str, default="OPTIX", choices=["CUDA", "OPTIX"])
     parser.add_argument("--cycles_samples", type=int, default=256)
     parser.add_argument("--cycles_use_denoising", action="store_true")
     parser.add_argument("--cycles_device", type=str, default="GPU", choices=["GPU", "CPU"])
 
     parser.add_argument("--video_fps", type=int, default=24)
-    parser.add_argument("--encode_workers", type=int, default=2,
-                        help="Background threads for mp4 encode (overlaps with rendering).")
 
     args = parser.parse_args(get_cli_argv())
-    process_geometry(args)
+
+    try:
+        process_geometry(args)
+    except Exception as e:
+        import traceback as _tb
+        err_msg = f"{type(e).__name__}: {e}"
+        print(f"[ERROR] obj {args.sha256} failed: {err_msg}")
+        _tb.print_exc()
+        emit_obj_done(sha256=args.sha256, status="error", error=err_msg)
+        sys.exit(0)

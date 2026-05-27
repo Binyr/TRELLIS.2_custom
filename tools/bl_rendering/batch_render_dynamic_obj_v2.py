@@ -1,38 +1,33 @@
 """
-Batch render dynamic OBJ files using Blender, with view-level S3 resume.
+Batch render dynamic OBJ files using Blender (v2, obj-level frame-major).
 
-Per-rank state lives in S3:
+Differences vs batch_render_dynamic_obj.py (v1):
+- Resume granularity is the obj, not the view. An obj is either fully rendered
+  and uploaded, or rebuilt from scratch.
+- Blender child emits [OBJ_DONE] (instead of [VIEW_DONE]). The whole local
+  obj dir is uploaded to S3 in a single recursive cp on success.
+- Local layout written by the child (mirrored on S3 under <sha256>/):
+    mesh.npz
+    result.json
+    result_rgb_mp4/view_XX.mp4
+
+Per-rank state lives on S3:
     {s3_output_root}/logs/progress_{rank}.json
     {s3_output_root}/logs/status_{rank}.log
-
-For each obj, Blender is invoked with only the views that are not yet marked
-success in the progress file. The batch layer parses Blender's stdout
-"[VIEW_DONE] {...json}" markers, uploads the corresponding per-view directory
-to S3, and updates progress/status logs.
-
-Usage:
-    python tools/bl_rendering/batch_render_dynamic_obj.py \
-        --manifest s3://.../dynamic_obj_manifest.json \
-        --s3_output_root s3://.../dynamic_obj_rendered \
-        --local_output_root /local-ssd/dynamic_obj_rendered \
-        --blender_path /tmp/blender-4.5.1-linux-x64/blender \
-        --world_size 1 --rank 0
 """
 
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
 
 
-VIEW_DONE_PREFIX = "[VIEW_DONE] "
+OBJ_DONE_PREFIX = "[OBJ_DONE] "
 
 
 # =====================================================================================
@@ -45,7 +40,6 @@ def _is_s3_uri(path: str) -> bool:
 
 
 def run_aws(args, retries: int = 2, sleep_s: float = 2.0, check: bool = False) -> subprocess.CompletedProcess:
-    """Run `aws ...` with simple retry."""
     last = None
     for attempt in range(retries + 1):
         proc = subprocess.run(["aws"] + args, capture_output=True, text=True)
@@ -82,21 +76,13 @@ def s3_get_file_to_local(s3_uri: str, local_path: str, retries: int = 2) -> bool
     return proc.returncode == 0
 
 
-def s3_exists_file(s3_uri: str) -> bool:
-    """Check whether an S3 object exists via `aws s3 ls`."""
-    proc = run_aws(["s3", "ls", s3_uri], retries=1)
-    if proc.returncode != 0:
-        return False
-    return s3_uri.rsplit("/", 1)[-1] in proc.stdout
-
-
 # =====================================================================================
-# Progress / status log (per-rank, stored on S3)
+# Progress / status log (per-rank, stored on S3, obj-level)
 # =====================================================================================
 
 
 class ProgressStore:
-    """Per-rank progress JSON + append-only status log, mirrored to S3."""
+    """Obj-level progress: { sha256: {status, render_time_s, s3_prefix, ...} }."""
 
     def __init__(self, s3_output_root: str, rank: int, local_state_dir: str):
         os.makedirs(local_state_dir, exist_ok=True)
@@ -109,7 +95,6 @@ class ProgressStore:
         self.progress: dict = {}
 
     def load(self):
-        # Try to pull progress + status from S3 (best-effort).
         if s3_get_file_to_local(self.s3_progress_uri, self.local_progress, retries=1):
             try:
                 with open(self.local_progress) as f:
@@ -121,21 +106,14 @@ class ProgressStore:
         else:
             print(f"[progress] No remote progress at {self.s3_progress_uri}; starting empty.")
             self.progress = {}
-        # Pull status log so appends are non-destructive.
         if not s3_get_file_to_local(self.s3_status_uri, self.local_status, retries=1):
             open(self.local_status, "w").close()
 
-    def view_key(self, sha256: str, view_idx: int) -> str:
-        return f"{sha256}/view_{int(view_idx):02d}"
+    def obj_status(self, sha256: str) -> str:
+        return self.progress.get(sha256, {}).get("status", "")
 
-    def view_status(self, sha256: str, view_idx: int) -> str:
-        return self.progress.get(self.view_key(sha256, view_idx), {}).get("status", "")
-
-    def is_view_success(self, sha256: str, view_idx: int) -> bool:
-        return self.view_status(sha256, view_idx) == "success"
-
-    def pending_views(self, sha256: str, all_view_indices) -> list:
-        return [v for v in all_view_indices if not self.is_view_success(sha256, v)]
+    def is_obj_success(self, sha256: str) -> bool:
+        return self.obj_status(sha256) == "success"
 
     def _save_progress_local(self):
         tmp = self.local_progress + ".tmp"
@@ -147,12 +125,10 @@ class ProgressStore:
         with open(self.local_status, "a") as f:
             f.write(line.rstrip("\n") + "\n")
 
-    def update_view(self, sha256: str, view_idx: int, entry: dict, status_line: str):
-        key = self.view_key(sha256, view_idx)
-        self.progress[key] = entry
+    def update_obj(self, sha256: str, entry: dict, status_line: str):
+        self.progress[sha256] = entry
         self._save_progress_local()
         self._append_status_local(status_line)
-        # Push to S3 (best-effort; failure is logged but not fatal).
         s3_cp_file(self.local_progress, self.s3_progress_uri, retries=1)
         s3_cp_file(self.local_status, self.s3_status_uri, retries=1)
 
@@ -178,7 +154,7 @@ def load_manifest(manifest_path: str, local_state_dir: str) -> list:
 # =====================================================================================
 
 
-def build_blender_cmd(args, item, extracted_path: str, local_obj_dir: str, views_to_render):
+def build_blender_cmd(args, item, extracted_path: str, local_obj_dir: str):
     cmd = [
         args.blender_path,
         "--background",
@@ -190,24 +166,19 @@ def build_blender_cmd(args, item, extracted_path: str, local_obj_dir: str, views
         "--resolution", str(args.resolution),
         "--render_engine", args.render_engine,
         "--num_cameras", str(args.num_cameras),
+        "--camera_stride", str(args.camera_stride),
         "--cycles_samples", str(args.cycles_samples),
         "--cycles_device", args.cycles_device,
         "--cycles_backend", args.cycles_backend,
         "--video_fps", str(args.video_fps),
         "--transparent_bg",
     ]
-    if args.render_normal_map:
-        cmd.append("--render_normal_map")
-    else:
-        cmd.append("--no_render_normal_map")
-    if views_to_render:
-        cmd += ["--render_view_indices"] + [str(int(v)) for v in views_to_render]
     return cmd
 
 
-def run_blender_streaming(cmd, timeout_s: float, on_view_done):
-    """Run blender, stream stdout, call on_view_done(payload) for each [VIEW_DONE] marker.
-    Returns (returncode, last_stdout_tail, last_stderr_tail).
+def run_blender_streaming(cmd, timeout_s: float, on_obj_done):
+    """Run blender, stream stdout, call on_obj_done(payload) for the [OBJ_DONE] marker.
+    Returns (returncode, last_stdout_tail, last_stderr_tail, payload_seen).
     """
     proc = subprocess.Popen(
         cmd,
@@ -218,6 +189,7 @@ def run_blender_streaming(cmd, timeout_s: float, on_view_done):
     )
     stdout_lines = []
     started_at = time.time()
+    payload_seen = None
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -225,26 +197,27 @@ def run_blender_streaming(cmd, timeout_s: float, on_view_done):
             stdout_lines.append(line)
             if len(stdout_lines) > 4000:
                 stdout_lines = stdout_lines[-3000:]
-            if line.startswith(VIEW_DONE_PREFIX):
-                payload_str = line[len(VIEW_DONE_PREFIX):].strip()
+            if line.startswith(OBJ_DONE_PREFIX):
+                payload_str = line[len(OBJ_DONE_PREFIX):].strip()
                 try:
                     payload = json.loads(payload_str)
-                    on_view_done(payload)
+                    payload_seen = payload
+                    on_obj_done(payload)
                 except Exception as e:
-                    print(f"[batch] Failed to parse VIEW_DONE: {e}; line={line!r}")
+                    print(f"[batch] Failed to parse OBJ_DONE: {e}; line={line!r}")
             elif line:
                 print(line)
             if timeout_s and (time.time() - started_at) > timeout_s:
                 proc.kill()
                 stderr_tail = proc.stderr.read() if proc.stderr else ""
-                return -1, "\n".join(stdout_lines[-200:]), stderr_tail[-2000:]
+                return -1, "\n".join(stdout_lines[-200:]), stderr_tail[-2000:], payload_seen
         proc.wait()
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
     stderr_tail = proc.stderr.read() if proc.stderr else ""
-    return proc.returncode, "\n".join(stdout_lines[-200:]), stderr_tail[-2000:]
+    return proc.returncode, "\n".join(stdout_lines[-200:]), stderr_tail[-2000:], payload_seen
 
 
 # =====================================================================================
@@ -257,51 +230,37 @@ def main():
     parser.add_argument("--manifest", type=str, required=True,
                         help="Path or s3 URI of dynamic_obj_manifest.json.")
     parser.add_argument("--s3_output_root", type=str, required=True,
-                        help="Final S3 destination prefix, e.g. s3://bucket/path/dynamic_obj_rendered")
-    parser.add_argument("--local_output_root", type=str, default="/local-ssd/dynamic_obj_rendered",
+                        help="Final S3 destination prefix, e.g. s3://bucket/path/dynamic_obj_rendered_v2")
+    parser.add_argument("--local_output_root", type=str, default="/local-ssd/dynamic_obj_rendered_v2",
                         help="Local scratch dir where Blender writes outputs before s3 cp.")
     parser.add_argument("--blender_path", type=str, default="/tmp/blender-4.5.1-linux-x64/blender")
     parser.add_argument("--render_script", type=str,
-                        default=os.path.join(os.path.dirname(__file__), "dynamic_obj_rendering.py"))
+                        default=os.path.join(os.path.dirname(__file__), "dynamic_obj_rendering_v2.py"))
     parser.add_argument("--world_size", type=int, default=1)
     parser.add_argument("--rank", type=int, default=0)
-    parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--resolution", type=int, default=1024)
     parser.add_argument("--num_cameras", type=int, default=16)
-    parser.add_argument("--camera_stride", type=int, default=1)
+    parser.add_argument("--camera_stride", type=int, default=2)
     parser.add_argument("--cycles_samples", type=int, default=256)
     parser.add_argument("--render_engine", type=str, default="CYCLES")
     parser.add_argument("--cycles_device", type=str, default="GPU")
     parser.add_argument("--cycles_backend", type=str, default="OPTIX")
     parser.add_argument("--video_fps", type=int, default=24)
-    parser.add_argument("--render_normal_map", action="store_true", default=True)
-    parser.add_argument("--no_render_normal_map", dest="render_normal_map", action="store_false")
-    parser.add_argument("--tmp_dir", type=str, default="/local-ssd/tmp_extract",
+    parser.add_argument("--tmp_dir", type=str, default="/local-ssd/tmp_extract_v2",
                         help="Where to extract zip contents.")
-    parser.add_argument("--state_dir", type=str, default="/local-ssd/render_dynamic_obj_state",
+    parser.add_argument("--state_dir", type=str, default="/local-ssd/render_dynamic_obj_state_v2",
                         help="Local dir for progress/status mirror and manifest cache.")
     parser.add_argument("--blender_timeout_s", type=float, default=60 * 60 * 12,
                         help="Per-obj Blender timeout (default 12h).")
     parser.add_argument("--max_items", type=int, default=None, help="Limit obj count (debug).")
-    parser.add_argument("--worker_tag", type=str, default="",
-                        help="Free-form tag (e.g. 'g0_p1') prefixed on logs to disambiguate parallel workers.")
-    parser.add_argument("--heartbeat_every_objs", type=int, default=1,
-                        help="Push heartbeat JSON to S3 every N completed objs (success+skip+fail).")
     args = parser.parse_args()
 
     if not _is_s3_uri(args.s3_output_root):
         raise SystemExit(f"--s3_output_root must be an s3:// URI, got: {args.s3_output_root}")
 
-    # When multiple workers share one pod, isolate their scratch / state dirs.
-    args.local_output_root = os.path.join(args.local_output_root, f"rank_{args.rank}")
-    args.tmp_dir = os.path.join(args.tmp_dir, f"rank_{args.rank}")
-    args.state_dir = os.path.join(args.state_dir, f"rank_{args.rank}")
     os.makedirs(args.local_output_root, exist_ok=True)
     os.makedirs(args.tmp_dir, exist_ok=True)
     os.makedirs(args.state_dir, exist_ok=True)
-
-    tag = f"[{args.worker_tag}]" if args.worker_tag else "[batch]"
-    print(f"{tag} rank={args.rank}/{args.world_size} pid={os.getpid()} "
-          f"local_out={args.local_output_root} state={args.state_dir}")
 
     all_view_indices = list(range(0, args.num_cameras, args.camera_stride))
     if not all_view_indices:
@@ -323,40 +282,6 @@ def main():
     progress = ProgressStore(args.s3_output_root, args.rank, args.state_dir)
     progress.load()
 
-    s3_heartbeat_uri = f"{args.s3_output_root.rstrip('/')}/logs/heartbeat_{args.rank}.json"
-    local_heartbeat = os.path.join(args.state_dir, f"heartbeat_{args.rank}.json")
-    started_at = time.time()
-
-    def push_heartbeat(i_done: int, n_total: int, status: str = "running",
-                       success: int = 0, skip: int = 0, fail: int = 0,
-                       extra: dict = None):
-        payload = {
-            "rank": args.rank,
-            "world_size": args.world_size,
-            "worker_tag": args.worker_tag,
-            "pid": os.getpid(),
-            "host": os.uname().nodename,
-            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
-            "started_at": started_at,
-            "ts": time.time(),
-            "items_total": n_total,
-            "items_done": i_done,
-            "success": success,
-            "skip": skip,
-            "fail": fail,
-            "status": status,
-        }
-        if extra:
-            payload.update(extra)
-        try:
-            with open(local_heartbeat, "w") as f:
-                json.dump(payload, f, indent=2)
-            s3_cp_file(local_heartbeat, s3_heartbeat_uri, retries=1)
-        except Exception as e:
-            print(f"{tag} heartbeat push failed: {e}")
-
-    push_heartbeat(0, len(manifest), status="starting")
-
     success_obj = 0
     skip_obj = 0
     fail_obj = 0
@@ -367,25 +292,27 @@ def main():
         file_path_in_zip = item["file_path_in_zip"]
         extension = item.get("extension", "")
 
-        pending_views = progress.pending_views(sha256, all_view_indices)
-        if len(pending_views) == 0:
+        if progress.is_obj_success(sha256):
             skip_obj += 1
             if (i + 1) % 100 == 0:
-                print(f"{tag} [{i+1}/{len(manifest)}] success={success_obj} skip={skip_obj} fail={fail_obj}")
+                print(f"[batch] [{i+1}/{len(manifest)}] success={success_obj} skip={skip_obj} fail={fail_obj}")
             continue
 
-        print(f"\n{tag} [{i+1}/{len(manifest)}] sha256={sha256[:16]}... ext={extension} pending_views={pending_views}")
+        print(f"\n[batch] [{i+1}/{len(manifest)}] sha256={sha256[:16]}... ext={extension}")
 
         tmp_extract_dir = os.path.join(args.tmp_dir, sha256)
         local_obj_dir = os.path.join(args.local_output_root, sha256)
         s3_obj_root = f"{args.s3_output_root.rstrip('/')}/{sha256}"
 
+        # Always start with a fresh local obj dir (no partial-view resume).
+        shutil.rmtree(local_obj_dir, ignore_errors=True)
+
         try:
             if not os.path.exists(zip_path):
                 msg = f"zip not found: {zip_path}"
                 print(f"  [SKIP] {msg}")
-                for v in pending_views:
-                    progress.update_view(sha256, v, _entry("missing_input", error=msg), _line(sha256, v, "missing_input", error=msg))
+                progress.update_obj(sha256, _entry("missing_input", error=msg),
+                                    _line(sha256, "missing_input", error=msg))
                 fail_obj += 1
                 continue
 
@@ -394,8 +321,8 @@ def main():
                 if file_path_in_zip not in zf.namelist():
                     msg = f"file not in zip: {file_path_in_zip}"
                     print(f"  [SKIP] {msg}")
-                    for v in pending_views:
-                        progress.update_view(sha256, v, _entry("missing_input", error=msg), _line(sha256, v, "missing_input", error=msg))
+                    progress.update_obj(sha256, _entry("missing_input", error=msg),
+                                        _line(sha256, "missing_input", error=msg))
                     fail_obj += 1
                     continue
                 zf.extract(file_path_in_zip, tmp_extract_dir)
@@ -404,71 +331,71 @@ def main():
             if not os.path.exists(extracted_path):
                 msg = f"extraction failed: {extracted_path}"
                 print(f"  [SKIP] {msg}")
-                for v in pending_views:
-                    progress.update_view(sha256, v, _entry("extract_failed", error=msg), _line(sha256, v, "extract_failed", error=msg))
+                progress.update_obj(sha256, _entry("extract_failed", error=msg),
+                                    _line(sha256, "extract_failed", error=msg))
                 fail_obj += 1
                 continue
 
             os.makedirs(local_obj_dir, exist_ok=True)
 
-            # Closure: handle a single [VIEW_DONE] -> upload + log.
-            def on_view_done(payload):
-                v = int(payload["view_index"])
+            # Closure: called when child emits [OBJ_DONE].
+            obj_done_state = {"uploaded": False, "status": None}
+
+            def on_obj_done(payload):
                 status = str(payload.get("status", "error"))
-                view_local_dir = os.path.join(local_obj_dir, f"view_{v:02d}")
-                s3_view_uri = f"{s3_obj_root}/view_{v:02d}"
+                obj_done_state["status"] = status
                 if status == "success":
-                    ok = s3_cp_dir(view_local_dir, s3_view_uri, retries=2)
+                    ok = s3_cp_dir(local_obj_dir, s3_obj_root, retries=2)
                     if ok:
                         entry = _entry(
                             "success",
-                            s3_prefix=s3_view_uri,
+                            s3_prefix=s3_obj_root,
                             render_time_s=payload.get("render_time_s"),
+                            num_frames=payload.get("num_frames"),
+                            num_views=payload.get("num_views"),
                         )
-                        line = _line(sha256, v, "success", render_time_s=payload.get("render_time_s"))
-                        shutil.rmtree(view_local_dir, ignore_errors=True)
+                        line = _line(
+                            sha256, "success",
+                            render_time_s=payload.get("render_time_s"),
+                            num_frames=payload.get("num_frames"),
+                            num_views=payload.get("num_views"),
+                        )
+                        obj_done_state["uploaded"] = True
                     else:
                         entry = _entry("upload_failed", error="s3 cp recursive failed")
-                        line = _line(sha256, v, "upload_failed", error="s3 cp recursive failed")
+                        line = _line(sha256, "upload_failed", error="s3 cp recursive failed")
                 else:
                     err = payload.get("error", "")
                     entry = _entry(status, error=err)
-                    line = _line(sha256, v, status, error=err)
-                progress.update_view(sha256, v, entry, line)
+                    line = _line(sha256, status, error=err)
+                progress.update_obj(sha256, entry, line)
 
-            cmd = build_blender_cmd(args, item, extracted_path, local_obj_dir, pending_views)
+            cmd = build_blender_cmd(args, item, extracted_path, local_obj_dir)
             t0 = time.time()
-            rc, stdout_tail, stderr_tail = run_blender_streaming(
+            rc, stdout_tail, stderr_tail, payload_seen = run_blender_streaming(
                 cmd,
                 timeout_s=args.blender_timeout_s,
-                on_view_done=on_view_done,
+                on_obj_done=on_obj_done,
             )
             elapsed = time.time() - t0
 
-            still_pending = progress.pending_views(sha256, all_view_indices)
-            still_pending = [v for v in still_pending if v in pending_views]
-
-            if rc == 0 and len(still_pending) == 0:
+            if rc == 0 and obj_done_state["status"] == "success" and obj_done_state["uploaded"]:
                 success_obj += 1
-                print(f"  [OK] {elapsed:.1f}s, all views uploaded")
+                print(f"  [OK] {elapsed:.1f}s, uploaded to {s3_obj_root}")
             else:
                 fail_obj += 1
-                fail_tag = "timeout" if rc == -1 else "blender_failed"
-                msg = f"rc={rc} tag={fail_tag}; pending_after={still_pending}"
+                tag = "timeout" if rc == -1 else (
+                    "blender_failed" if obj_done_state["status"] is None else obj_done_state["status"]
+                )
+                msg = f"rc={rc} tag={tag}; payload={payload_seen}"
                 print(f"  [FAIL] {msg} ({elapsed:.1f}s)")
-                # Upload tail logs alongside obj for diagnostics.
                 _upload_error_log(args.state_dir, s3_obj_root, sha256, rc, stdout_tail, stderr_tail)
-                # Mark views that did not receive a [VIEW_DONE] this run.
-                for v in still_pending:
-                    if progress.view_status(sha256, v) == "":
-                        progress.update_view(
-                            sha256, v, _entry(fail_tag, error=msg),
-                            _line(sha256, v, fail_tag, error=msg),
-                        )
+                if obj_done_state["status"] is None:
+                    progress.update_obj(
+                        sha256, _entry(tag, error=msg),
+                        _line(sha256, tag, error=msg),
+                    )
 
-        except subprocess.TimeoutExpired:
-            fail_obj += 1
-            print(f"  [TIMEOUT]")
         except Exception as e:
             fail_obj += 1
             print(f"  [ERROR] {type(e).__name__}: {e}")
@@ -476,16 +403,10 @@ def main():
             shutil.rmtree(tmp_extract_dir, ignore_errors=True)
             shutil.rmtree(local_obj_dir, ignore_errors=True)
 
-        if (i + 1) % args.heartbeat_every_objs == 0:
-            push_heartbeat(i + 1, len(manifest), status="running",
-                           success=success_obj, skip=skip_obj, fail=fail_obj)
-
         if (i + 1) % 10 == 0:
-            print(f"{tag} [{i+1}/{len(manifest)}] success={success_obj} skip={skip_obj} fail={fail_obj}")
+            print(f"[batch] [{i+1}/{len(manifest)}] success={success_obj} skip={skip_obj} fail={fail_obj}")
 
-    push_heartbeat(len(manifest), len(manifest), status="done",
-                   success=success_obj, skip=skip_obj, fail=fail_obj)
-    print(f"\n{tag} DONE. success={success_obj} skip={skip_obj} fail={fail_obj} total={len(manifest)}")
+    print(f"\n[batch] DONE. success={success_obj} skip={skip_obj} fail={fail_obj} total={len(manifest)}")
 
 
 def _entry(status: str, **extra) -> dict:
@@ -496,9 +417,9 @@ def _entry(status: str, **extra) -> dict:
     return out
 
 
-def _line(sha256: str, view_idx: int, status: str, **extra) -> str:
+def _line(sha256: str, status: str, **extra) -> str:
     ts = datetime.now(timezone.utc).isoformat()
-    parts = [ts, f"{sha256}/view_{int(view_idx):02d}", status]
+    parts = [ts, sha256, status]
     for k, v in extra.items():
         if v is None:
             continue
