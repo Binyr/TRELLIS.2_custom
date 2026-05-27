@@ -201,9 +201,15 @@ def write_16bit_depth_video_streaming_from_pngs(image_paths: List[str], save_pat
     # (cgroup_cpu_quota / workers_per_pod). Fall back to a small constant in
     # standalone runs.
     _enc_threads = int(os.environ.get("BLENDER_NUM_THREADS", "0")) or 4
-    stream.options = {"crf": "10", "threads": str(_enc_threads)}
+    stream.options = {"crf": "10"}
+    # libx265 caps frame-level threads at X265_MAX_FRAME_THREADS (=16). Going
+    # over that triggers `avcodec_open2("libx265", {...})` InvalidData. Clamp
+    # the wrapper-level thread_count accordingly; x265's own internal pool
+    # (sized from host nproc, but cgroup-throttled) still handles the heavy
+    # parallelism.
+    _enc_threads = max(1, min(int(_enc_threads), 16))
     try:
-        stream.thread_count = int(_enc_threads)
+        stream.thread_count = _enc_threads
         stream.thread_type = "FRAME"
     except Exception:
         pass
@@ -1109,7 +1115,7 @@ def process_geometry(args):
     frame_indices = np.arange(raw_frame_start, raw_frame_end + 1, dtype=np.int32)
     print(f"Raw animation range: [{raw_frame_start}, {raw_frame_end}] ({len(frame_indices)} frames)")
 
-    MAX_FRAMES = 121
+    MAX_FRAMES = int(args.max_frames)
     if len(frame_indices) > MAX_FRAMES:
         crop_start = (len(frame_indices) - MAX_FRAMES) // 2
         frame_indices = frame_indices[crop_start : crop_start + MAX_FRAMES]
@@ -1409,6 +1415,8 @@ if __name__ == "__main__":
     parser.add_argument("--cycles_device", type=str, default="GPU", choices=["GPU", "CPU"])
 
     parser.add_argument("--video_fps", type=int, default=24)
+    parser.add_argument("--max_frames", type=int, default=121,
+                        help="Cap on per-obj animation length (center-cropped). Default 121.")
     parser.add_argument("--encode_workers", type=int, default=2,
                         help="Background threads for mp4 encode (overlaps with rendering).")
 

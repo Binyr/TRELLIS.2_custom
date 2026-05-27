@@ -18,6 +18,11 @@
 #
 # Env knobs:
 #   BLENDER_PER_GPU   (default 1)        - workers per GPU
+#       Benchmark on H200 + 20-core cgroup (4 obj x 4 view x 10 frame, 1024 res):
+#         1p: wall=86.8s  per-view mean=5.50s
+#         2p: wall=79.3s  per-view mean=9.90s  (+9% wall, but 1.8x slower per view)
+#       2p only helps when there is spare CPU to overlap setup/encode with the
+#       neighbor's GPU work. Stick to 1 unless CPU quota >> 20 cores.
 #   NUM_GPUS          (auto)             - override GPU count
 #   RESPAWN_SLEEP     (default 30)       - sleep before restarting a dead worker
 #   STDOUT_SYNC_SEC   (default 60)       - sync each worker stdout to S3 every N sec
@@ -51,7 +56,7 @@ fi
 GLOBAL_WS=${1:-1}
 GLOBAL_RANK=${2:-0}
 
-BLENDER_PER_GPU=${BLENDER_PER_GPU:-2}
+BLENDER_PER_GPU=${BLENDER_PER_GPU:-1}
 RESPAWN_SLEEP=${RESPAWN_SLEEP:-30}
 STDOUT_SYNC_SEC=${STDOUT_SYNC_SEC:-60}
 MAX_RESPAWN=${MAX_RESPAWN:-1000000}

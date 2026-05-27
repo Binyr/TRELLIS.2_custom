@@ -222,6 +222,7 @@ def build_blender_cmd(args, item, extracted_path: str, local_obj_dir: str, views
         "--cycles_device", args.cycles_device,
         "--cycles_backend", args.cycles_backend,
         "--video_fps", str(args.video_fps),
+        "--max_frames", str(args.max_frames),
         "--transparent_bg",
     ]
     if args.render_normal_map:
@@ -310,6 +311,8 @@ def main():
     parser.add_argument("--blender_timeout_s", type=float, default=60 * 60 * 12,
                         help="Per-obj Blender timeout (default 12h).")
     parser.add_argument("--max_items", type=int, default=None, help="Limit obj count (debug).")
+    parser.add_argument("--max_frames", type=int, default=121,
+                        help="Per-obj animation frame cap, passed through to the Blender script.")
     parser.add_argument("--worker_tag", type=str, default="",
                         help="Free-form tag (e.g. 'g0_p1') prefixed on logs to disambiguate parallel workers.")
     parser.add_argument("--heartbeat_every_objs", type=int, default=1,
