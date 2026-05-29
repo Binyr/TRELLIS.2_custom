@@ -386,26 +386,29 @@ def main():
         except Exception as e:
             print(f"{tag} heartbeat push failed: {e}")
 
-    push_heartbeat(0, len(manifest), status="starting")
+    todo = []
+    finished_obj = 0
+    for item in manifest:
+        pending_views = progress.pending_views(item["sha256"], all_view_indices)
+        if len(pending_views) == 0:
+            finished_obj += 1
+        else:
+            todo.append((item, pending_views))
+    print(f"[batch] finished obj: {finished_obj}; remaining obj: {len(todo)}; total obj: {len(manifest)}")
+
+    push_heartbeat(finished_obj, len(manifest), status="starting")
 
     success_obj = 0
-    skip_obj = 0
+    skip_obj = finished_obj
     fail_obj = 0
 
-    for i, item in enumerate(manifest):
+    for i, (item, pending_views) in enumerate(todo):
         sha256 = item["sha256"]
         zip_path = item["zip_path"]
         file_path_in_zip = item["file_path_in_zip"]
         extension = item.get("extension", "")
 
-        pending_views = progress.pending_views(sha256, all_view_indices)
-        if len(pending_views) == 0:
-            skip_obj += 1
-            if (i + 1) % 100 == 0:
-                print(f"{tag} [{i+1}/{len(manifest)}] success={success_obj} skip={skip_obj} fail={fail_obj}")
-            continue
-
-        print(f"\n{tag} [{i+1}/{len(manifest)}] sha256={sha256[:16]}... ext={extension} pending_views={pending_views}")
+        print(f"\n{tag} [{i+1}/{len(todo)}] sha256={sha256[:16]}... ext={extension} pending_views={pending_views}")
 
         tmp_extract_dir = os.path.join(args.tmp_dir, sha256)
         local_obj_dir = os.path.join(args.local_output_root, sha256)
@@ -511,12 +514,13 @@ def main():
         # per-view throttling never hides a fully-completed obj.
         progress.flush()
 
-        if (i + 1) % args.heartbeat_every_objs == 0:
-            push_heartbeat(i + 1, len(manifest), status="running",
+        items_done = finished_obj + i + 1
+        if items_done % args.heartbeat_every_objs == 0:
+            push_heartbeat(items_done, len(manifest), status="running",
                            success=success_obj, skip=skip_obj, fail=fail_obj)
 
         if (i + 1) % 10 == 0:
-            print(f"{tag} [{i+1}/{len(manifest)}] success={success_obj} skip={skip_obj} fail={fail_obj}")
+            print(f"{tag} [{i+1}/{len(todo)}] success={success_obj} skip={skip_obj} fail={fail_obj}")
 
     progress.flush()
     push_heartbeat(len(manifest), len(manifest), status="done",
