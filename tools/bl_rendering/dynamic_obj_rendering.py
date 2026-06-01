@@ -793,7 +793,7 @@ def init_random_lighting(camera_dir: np.ndarray, rng: np.random.Generator) -> di
             "shadow_soft_size": float(new_light.data.shadow_soft_size),
         })
 
-    bg_strength = float(max(total_strength, 0.0))
+    bg_strength = float(max(total_strength, 0.3))
     bg_node = nodes.new(type="ShaderNodeBackground")
     bg_node.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
     bg_node.inputs["Strength"].default_value = bg_strength
