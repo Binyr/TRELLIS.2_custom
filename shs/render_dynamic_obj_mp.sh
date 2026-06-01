@@ -174,6 +174,7 @@ worker_supervisor() {
             --render_engine CYCLES \
             --cycles_device GPU \
             --cycles_backend OPTIX \
+            --blender_timeout_s 3600 \
             --no_render_normal_map \
             --world_size "$SUB_WS" --rank "$rank" \
             --worker_tag "$worker_tag" \

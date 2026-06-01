@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,7 @@ from datetime import datetime, timezone
 
 
 VIEW_DONE_PREFIX = "[VIEW_DONE] "
+TERMINAL_SKIP_STATUSES = {"success", "missing_resource"}
 
 
 # =====================================================================================
@@ -140,8 +142,11 @@ class ProgressStore:
     def is_view_success(self, sha256: str, view_idx: int) -> bool:
         return self.view_status(sha256, view_idx) == "success"
 
+    def is_view_terminal(self, sha256: str, view_idx: int) -> bool:
+        return self.view_status(sha256, view_idx) in TERMINAL_SKIP_STATUSES
+
     def pending_views(self, sha256: str, all_view_indices) -> list:
-        return [v for v in all_view_indices if not self.is_view_success(sha256, v)]
+        return [v for v in all_view_indices if not self.is_view_terminal(sha256, v)]
 
     def _save_progress_local(self):
         tmp = self.local_progress + ".tmp"
@@ -235,45 +240,62 @@ def build_blender_cmd(args, item, extracted_path: str, local_obj_dir: str, views
 
 
 def run_blender_streaming(cmd, timeout_s: float, on_view_done):
-    """Run blender, stream stdout, call on_view_done(payload) for each [VIEW_DONE] marker.
+    """Run blender, stream combined stdout/stderr, call on_view_done for VIEW_DONE markers.
     Returns (returncode, last_stdout_tail, last_stderr_tail).
     """
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
     stdout_lines = []
     started_at = time.time()
+    timed_out = False
+
+    def handle_line(line: str):
+        line = line.rstrip("\n")
+        stdout_lines.append(line)
+        if len(stdout_lines) > 4000:
+            del stdout_lines[:-3000]
+        if line.startswith(VIEW_DONE_PREFIX):
+            payload_str = line[len(VIEW_DONE_PREFIX):].strip()
+            try:
+                payload = json.loads(payload_str)
+                on_view_done(payload)
+            except Exception as e:
+                print(f"[batch] Failed to parse VIEW_DONE: {e}; line={line!r}")
+        elif line:
+            print(line)
+
     try:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            stdout_lines.append(line)
-            if len(stdout_lines) > 4000:
-                stdout_lines = stdout_lines[-3000:]
-            if line.startswith(VIEW_DONE_PREFIX):
-                payload_str = line[len(VIEW_DONE_PREFIX):].strip()
-                try:
-                    payload = json.loads(payload_str)
-                    on_view_done(payload)
-                except Exception as e:
-                    print(f"[batch] Failed to parse VIEW_DONE: {e}; line={line!r}")
-            elif line:
-                print(line)
+        fd = proc.stdout.fileno()
+        while proc.poll() is None:
             if timeout_s and (time.time() - started_at) > timeout_s:
+                timed_out = True
                 proc.kill()
-                stderr_tail = proc.stderr.read() if proc.stderr else ""
-                return -1, "\n".join(stdout_lines[-200:]), stderr_tail[-2000:]
+                break
+            ready, _, _ = select.select([fd], [], [], 1.0)
+            if not ready:
+                continue
+            line = proc.stdout.readline()
+            if line == "":
+                break
+            handle_line(line)
+
+        for line in proc.stdout:
+            handle_line(line)
         proc.wait()
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-    stderr_tail = proc.stderr.read() if proc.stderr else ""
-    return proc.returncode, "\n".join(stdout_lines[-200:]), stderr_tail[-2000:]
+    stdout_tail = "\n".join(stdout_lines[-200:])
+    if timed_out:
+        return -1, stdout_tail, ""
+    return proc.returncode, stdout_tail, ""
 
 
 # =====================================================================================
@@ -471,6 +493,7 @@ def main():
                 progress.update_view(sha256, v, entry, line)
 
             cmd = build_blender_cmd(args, item, extracted_path, local_obj_dir, pending_views)
+            print(f"  [blender] launching: {cmd[0]} sha256={sha256[:16]} pending_views={pending_views}")
             t0 = time.time()
             rc, stdout_tail, stderr_tail = run_blender_streaming(
                 cmd,
@@ -488,13 +511,15 @@ def main():
             else:
                 fail_obj += 1
                 fail_tag = "timeout" if rc == -1 else "blender_failed"
+                if _is_missing_resource_error(stdout_tail, stderr_tail):
+                    fail_tag = "missing_resource"
                 msg = f"rc={rc} tag={fail_tag}; pending_after={still_pending}"
                 print(f"  [FAIL] {msg} ({elapsed:.1f}s)")
                 # Upload tail logs alongside obj for diagnostics.
                 _upload_error_log(args.state_dir, s3_obj_root, sha256, rc, stdout_tail, stderr_tail)
                 # Mark views that did not receive a [VIEW_DONE] this run.
                 for v in still_pending:
-                    if progress.view_status(sha256, v) == "":
+                    if fail_tag == "missing_resource" or progress.view_status(sha256, v) == "":
                         progress.update_view(
                             sha256, v, _entry(fail_tag, error=msg),
                             _line(sha256, v, fail_tag, error=msg),
@@ -544,6 +569,11 @@ def _line(sha256: str, view_idx: int, status: str, **extra) -> str:
             continue
         parts.append(f"{k}={v}")
     return " ".join(parts)
+
+
+def _is_missing_resource_error(stdout_tail: str, stderr_tail: str) -> bool:
+    text = f"{stdout_tail}\n{stderr_tail}"
+    return "Missing resource" in text or "Couldn't read file" in text
 
 
 def _upload_error_log(state_dir: str, s3_obj_root: str, sha256: str, rc: int, stdout_tail: str, stderr_tail: str):
