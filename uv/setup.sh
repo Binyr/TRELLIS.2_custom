@@ -176,6 +176,8 @@ echo "[INSTALL] torchsparse..."
 apt update
 apt install -y libsparsehash-dev ninja-build
 apt install -y  libegl1
+# Archive extractors needed for TexVerse-Animation stage B-3 (.7z / .rar inside zips).
+apt install -y p7zip-full unrar
 # x=$(pwd)
 # cp -r  /efs/yanruibin/projects/video_pixal3d_train/third_party/torchsparse third_party/
 # cd third_party/torchsparse
@@ -311,5 +313,7 @@ if [ ! -f "$BLENDER_PATH" ] ; then
 fi
 /tmp/blender-4.5.1-linux-x64/4.5/python/bin/python3.11 -m pip install -q pillow av
 echo "[DONE] Blender ready at: $BLENDER_PATH"
+
+apt-get install -y p7zip-full unrar
 
 echo "[SETUP COMPLETE] Total time: $(( SECONDS - _SETUP_START_TIME )) seconds"

@@ -7,10 +7,17 @@ Given:
   - data_root:      e.g. /local-ssd/data/texverse_1k_animate
 
 For each target id present in model_paths, open its zip and pick the main
-model file inside (preferring formats Blender can ingest directly). Filter
-out zips whose only model is .blend / nested .zip / .dae / .obj since the
-current `dynamic_obj_rendering.py` does not support those (handled in a
-follow-up stage).
+model file inside. Entries are tagged with a `stage` field so downstream
+launchers can run them in waves with different renderer support:
+
+  - stage="A"             : top-level .fbx / .glb / .gltf (current renderer)
+  - stage="B-1-nested"    : top-level only nested .zip, but inner zip
+                            contains .fbx / .glb / .gltf
+  - stage="B-2-blend"     : top-level .blend (needs blend importer)
+  - stage="B-3-archive"   : .7z / .rar inside (needs 7z/unrar)
+
+Anything else is recorded in `skipped` (no model / unsupported / corrupted /
+nested zip where inner is also .blend or another archive, etc.).
 
 Output JSON schema (manifest entries are compatible with
 `batch_render_texverse_animate.py`):
@@ -20,28 +27,21 @@ Output JSON schema (manifest entries are compatible with
     "manifest": [
       {
         "id": "<id>",
+        "stage": "A" | "B-1-nested" | "B-2-blend" | "B-3-archive",
         "zip_path": "/abs/path/to/<id>.zip",
-        "file_path_in_zip": "source/foo.fbx",
-        "extension": ".fbx",
+        "file_path_in_zip": "source/foo.fbx" | "source/foo.zip" | "source/foo.blend" | "source/foo.7z",
+        "extension": ".fbx" | ".glb" | ".gltf" | ".blend",
+        "nested_zip_path": "EgyptianStyleTreasureChest.fbx",  # only for B-1
+        "archive_kind": "7z" | "rar",                          # only for B-3
         "source": "texverse_animate"
       },
       ...
     ],
     "skipped": [
-      {"id": "...", "reason": "not_in_model_paths" | "unsupported_ext" |
-                                "no_model_in_zip" | "zip_open_failed",
-       "detail": "...optional..."},
+      {"id": "...", "reason": "...", "detail": "...optional..."},
       ...
     ]
   }
-
-Usage (on the remote machine):
-    python tools/bl_rendering/prepare_texverse_animate_manifest.py \
-        --data_root /local-ssd/data/texverse_1k_animate \
-        --id_list   /local-ssd/data/texverse_1k_animate/TexVerse-Animation_id_list.txt \
-        --model_paths /local-ssd/data/texverse_1k_animate/model_paths.txt \
-        --output    /local-ssd/data/texverse_1k_animate/texverse_animate_manifest.json \
-        --num_workers 16
 """
 
 import argparse
@@ -53,13 +53,19 @@ import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
-SUPPORTED_EXTENSIONS_PRIORITY = [".glb", ".gltf", ".fbx"]
-DEFERRED_EXTENSIONS = {".blend", ".zip", ".dae", ".obj"}
-ALL_KNOWN_EXTENSIONS = set(SUPPORTED_EXTENSIONS_PRIORITY) | DEFERRED_EXTENSIONS
+DIRECT_EXTENSIONS_PRIORITY = [".glb", ".gltf", ".fbx"]  # stage A
+BLEND_EXT = ".blend"                                     # stage B-2
+NESTED_ZIP_EXT = ".zip"                                  # stage B-1 trigger
+ARCHIVE_EXTS = (".7z", ".rar")                           # stage B-3
+DAE_OBJ = {".dae", ".obj"}                               # always skipped
+ALL_KNOWN_EXTENSIONS = (set(DIRECT_EXTENSIONS_PRIORITY)
+                        | {BLEND_EXT, NESTED_ZIP_EXT}
+                        | set(ARCHIVE_EXTS)
+                        | DAE_OBJ)
 
 
-def pick_main_file(namelist):
-    """Pick best model file from a zip namelist. Returns (file_path, ext) or (None, None)."""
+def _index_namelist(namelist):
+    """Group entries in a zip namelist by lowercase extension."""
     by_ext = {}
     for name in namelist:
         if name.endswith("/"):
@@ -67,34 +73,110 @@ def pick_main_file(namelist):
         ext = os.path.splitext(name)[1].lower()
         if ext in ALL_KNOWN_EXTENSIONS:
             by_ext.setdefault(ext, []).append(name)
-
-    for ext in SUPPORTED_EXTENSIONS_PRIORITY:
-        if ext in by_ext:
-            files = sorted(by_ext[ext], key=lambda p: (p.count("/"), len(p), p))
-            return files[0], ext
-
-    for ext in DEFERRED_EXTENSIONS:
-        if ext in by_ext:
-            return None, ext
-
-    return None, None
+    return by_ext
 
 
-def inspect_zip(arg):
-    """Worker: open zip, pick main file. Returns (id, zip_path, status, file_path, ext, detail)."""
+def _pick_first(files):
+    return sorted(files, key=lambda p: (p.count("/"), len(p), p))[0]
+
+
+def _peek_nested_zip(outer_zf, nested_zip_member):
+    """Open one level of nested zip; return its sorted namelist, or None on failure."""
+    try:
+        with outer_zf.open(nested_zip_member) as fp:
+            data = fp.read()
+        import io
+        with zipfile.ZipFile(io.BytesIO(data)) as inner:
+            return inner.namelist()
+    except Exception:
+        return None
+
+
+def classify_zip(arg):
+    """Worker: open one outer zip and decide its stage.
+
+    Returns one of:
+        ("ok",         id, zip_path, entry_dict)                 # any stage A/B-*
+        ("skip",       id, zip_path, reason, detail)
+    """
     obj_id, zip_path = arg
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             names = zf.namelist()
-    except Exception as e:
-        return obj_id, zip_path, "zip_open_failed", None, None, f"{type(e).__name__}: {e}"
+            by_ext = _index_namelist(names)
 
-    file_path, ext = pick_main_file(names)
-    if file_path is None:
-        if ext is None:
-            return obj_id, zip_path, "no_model_in_zip", None, None, ""
-        return obj_id, zip_path, "unsupported_ext", None, ext, f"only_found={ext}"
-    return obj_id, zip_path, "ok", file_path, ext, ""
+            # ---- stage A: directly-renderable model at top level ----
+            for ext in DIRECT_EXTENSIONS_PRIORITY:
+                if ext in by_ext:
+                    return ("ok", obj_id, zip_path, {
+                        "id": obj_id,
+                        "stage": "A",
+                        "zip_path": zip_path,
+                        "file_path_in_zip": _pick_first(by_ext[ext]),
+                        "extension": ext,
+                        "source": "texverse_animate",
+                    })
+
+            # ---- stage B-2: top-level .blend ----
+            if BLEND_EXT in by_ext:
+                return ("ok", obj_id, zip_path, {
+                    "id": obj_id,
+                    "stage": "B-2-blend",
+                    "zip_path": zip_path,
+                    "file_path_in_zip": _pick_first(by_ext[BLEND_EXT]),
+                    "extension": BLEND_EXT,
+                    "source": "texverse_animate",
+                })
+
+            # ---- stage B-1: nested .zip whose inner has a direct-renderable ----
+            if NESTED_ZIP_EXT in by_ext:
+                # Try the first inner zip (sorted by shallowness/length) first.
+                inner_zip_name = _pick_first(by_ext[NESTED_ZIP_EXT])
+                inner_names = _peek_nested_zip(zf, inner_zip_name)
+                if inner_names is None:
+                    return ("skip", obj_id, zip_path,
+                            "nested_zip_open_failed", f"inner={inner_zip_name}")
+                inner_by_ext = _index_namelist(inner_names)
+                # User decision: B-1 ONLY accepts fbx/glb/gltf (not .blend) for now.
+                for ext in DIRECT_EXTENSIONS_PRIORITY:
+                    if ext in inner_by_ext:
+                        return ("ok", obj_id, zip_path, {
+                            "id": obj_id,
+                            "stage": "B-1-nested",
+                            "zip_path": zip_path,
+                            "file_path_in_zip": inner_zip_name,  # the inner .zip member
+                            "extension": ext,
+                            "nested_inner_path": _pick_first(inner_by_ext[ext]),
+                            "source": "texverse_animate",
+                        })
+                # Inner zip exists but has no renderable. Skip.
+                inner_kinds = {k: len(v) for k, v in inner_by_ext.items()}
+                return ("skip", obj_id, zip_path,
+                        "nested_no_renderable", f"inner_ext={inner_kinds}")
+
+            # ---- stage B-3: top-level .7z or .rar ----
+            for kind_ext in ARCHIVE_EXTS:
+                if kind_ext in by_ext:
+                    return ("ok", obj_id, zip_path, {
+                        "id": obj_id,
+                        "stage": "B-3-archive",
+                        "zip_path": zip_path,
+                        "file_path_in_zip": _pick_first(by_ext[kind_ext]),
+                        "extension": kind_ext,
+                        "archive_kind": kind_ext.lstrip("."),
+                        "source": "texverse_animate",
+                    })
+
+            # ---- nothing usable ----
+            if DAE_OBJ & set(by_ext.keys()):
+                only = sorted(DAE_OBJ & set(by_ext.keys()))
+                return ("skip", obj_id, zip_path,
+                        "unsupported_ext", f"only_found={','.join(only)}")
+            return ("skip", obj_id, zip_path, "no_model_in_zip", "")
+
+    except Exception as e:
+        return ("skip", obj_id, zip_path,
+                "zip_open_failed", f"{type(e).__name__}: {e}")
 
 
 def main():
@@ -133,42 +215,38 @@ def main():
 
     manifest = []
     skipped = [{"id": oid, "reason": "not_in_model_paths"} for oid in missing_in_model_paths]
-    ext_counts = {}
+    stage_counts = {}
     reason_counts = {"not_in_model_paths": len(missing_in_model_paths)}
 
     t0 = time.time()
     with ProcessPoolExecutor(max_workers=args.num_workers) as ex:
-        futures = {ex.submit(inspect_zip, c): c[0] for c in candidates}
+        futures = {ex.submit(classify_zip, c): c[0] for c in candidates}
         done = 0
         for fut in as_completed(futures):
-            obj_id, zip_path, status, file_path, ext, detail = fut.result()
+            res = fut.result()
             done += 1
             if done % 2000 == 0:
                 elapsed = time.time() - t0
                 rate = done / elapsed if elapsed > 0 else 0
                 print(f"[manifest] inspected {done}/{len(candidates)} "
                       f"({rate:.0f} zip/s, ok={len(manifest)})")
-            if status == "ok":
-                manifest.append({
-                    "id": obj_id,
-                    "zip_path": zip_path,
-                    "file_path_in_zip": file_path,
-                    "extension": ext,
-                    "source": "texverse_animate",
-                })
-                ext_counts[ext] = ext_counts.get(ext, 0) + 1
+            if res[0] == "ok":
+                _, obj_id, zip_path, entry = res
+                manifest.append(entry)
+                stage_counts[entry["stage"]] = stage_counts.get(entry["stage"], 0) + 1
             else:
-                skipped.append({"id": obj_id, "reason": status,
+                _, obj_id, zip_path, reason, detail = res
+                skipped.append({"id": obj_id, "reason": reason,
                                 "detail": detail, "zip_path": zip_path})
-                reason_counts[status] = reason_counts.get(status, 0) + 1
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
     elapsed = time.time() - t0
     print(f"[manifest] inspection done in {elapsed:.1f}s")
     print(f"[manifest] manifest entries: {len(manifest)}")
-    print(f"[manifest] ext distribution : {ext_counts}")
+    print(f"[manifest] per-stage counts : {stage_counts}")
     print(f"[manifest] skip reasons     : {reason_counts}")
 
-    manifest.sort(key=lambda x: x["id"])
+    manifest.sort(key=lambda x: (x["stage"], x["id"]))
 
     output_data = {
         "metadata": {
@@ -179,10 +257,14 @@ def main():
             "candidate_count": len(candidates),
             "manifest_count": len(manifest),
             "skipped_count": len(skipped),
-            "extension_distribution": ext_counts,
+            "stage_counts": stage_counts,
             "skip_reasons": reason_counts,
-            "supported_extensions": SUPPORTED_EXTENSIONS_PRIORITY,
-            "deferred_extensions": sorted(DEFERRED_EXTENSIONS),
+            "stages": {
+                "A":            "top-level .fbx/.glb/.gltf, renderable today",
+                "B-1-nested":   "outer .zip wraps a nested .zip with .fbx/.glb/.gltf inside",
+                "B-2-blend":    "top-level .blend (needs blend importer)",
+                "B-3-archive":  "top-level .7z or .rar (needs 7z/unrar)",
+            },
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
         "manifest": manifest,

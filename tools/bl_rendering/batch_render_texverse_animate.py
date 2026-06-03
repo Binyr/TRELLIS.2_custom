@@ -34,6 +34,10 @@ import zipfile
 from datetime import datetime, timezone
 
 
+RENDERABLE_EXTS = (".fbx", ".glb", ".gltf")  # what dynamic_obj_rendering.py natively renders without .blend importer
+ARCHIVE_BLEND_EXT = ".blend"
+
+
 VIEW_DONE_PREFIX = "[VIEW_DONE] "
 TERMINAL_SKIP_STATUSES = {"success", "missing_resource"}
 
@@ -196,6 +200,130 @@ class ProgressStore:
 # =====================================================================================
 
 
+def _scan_for_main_model(root_dir: str) -> str:
+    """Walk root_dir, prefer the shallowest fbx/glb/gltf. Returns absolute path or ""."""
+    best = None
+    best_key = None
+    for dp, _, fns in os.walk(root_dir):
+        for fn in fns:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in RENDERABLE_EXTS:
+                p = os.path.join(dp, fn)
+                # Lower priority = better: depth, then path length, then lex.
+                rel = os.path.relpath(p, root_dir)
+                key = (rel.count(os.sep), len(rel), rel.lower(),
+                       RENDERABLE_EXTS.index(ext))
+                if best_key is None or key < best_key:
+                    best = p
+                    best_key = key
+    return best or ""
+
+
+def _scan_blend_only(root_dir: str) -> bool:
+    """True if root_dir contains a .blend but no fbx/glb/gltf (B-3 skip rule)."""
+    has_blend = False
+    has_renderable = False
+    for dp, _, fns in os.walk(root_dir):
+        for fn in fns:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext == ARCHIVE_BLEND_EXT:
+                has_blend = True
+            elif ext in RENDERABLE_EXTS:
+                has_renderable = True
+    return has_blend and not has_renderable
+
+
+def _extract_inner_zip(outer_root: str, inner_zip_rel: str, dest_dir: str) -> bool:
+    """B-1: extract inner_zip_rel (inside the already-extracted outer zip) into dest_dir."""
+    inner_zip_abs = os.path.join(outer_root, inner_zip_rel)
+    if not os.path.isfile(inner_zip_abs):
+        print(f"  [B-1] inner zip not found: {inner_zip_rel}")
+        return False
+    try:
+        with zipfile.ZipFile(inner_zip_abs, "r") as izf:
+            izf.extractall(dest_dir)
+        return True
+    except Exception as e:
+        print(f"  [B-1] inner zip extract failed: {type(e).__name__}: {e}")
+        return False
+
+
+def _extract_archive(archive_path: str, kind: str, dest_dir: str, timeout_s: int = 300) -> bool:
+    """B-3: shell out to 7z / unrar to expand a .7z/.rar."""
+    os.makedirs(dest_dir, exist_ok=True)
+    if kind == "7z":
+        cmd = ["7z", "x", "-y", f"-o{dest_dir}", archive_path]
+    elif kind == "rar":
+        cmd = ["unrar", "x", "-y", "-o+", archive_path, dest_dir + os.sep]
+    else:
+        print(f"  [B-3] unknown archive kind: {kind}")
+        return False
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        if proc.returncode != 0:
+            print(f"  [B-3] {cmd[0]} rc={proc.returncode}: "
+                  f"{proc.stderr.strip()[:300] or proc.stdout.strip()[-300:]}")
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        print(f"  [B-3] {cmd[0]} timeout after {timeout_s}s on {archive_path}")
+        return False
+    except FileNotFoundError:
+        print(f"  [B-3] {cmd[0]} not installed on this machine")
+        return False
+
+
+def resolve_object_path(item: dict, tmp_extract_dir: str) -> tuple:
+    """Given an already-extracted outer zip dir, return (object_path, skip_reason).
+    object_path is the absolute path of the file to feed to Blender's --object_path;
+    skip_reason is "" on success, non-empty string when the item should be skipped."""
+    stage = item.get("stage", "A")
+    if stage == "A":
+        p = os.path.join(tmp_extract_dir, item["file_path_in_zip"])
+        if not os.path.exists(p):
+            return "", f"extract_failed:{p}"
+        return p, ""
+
+    if stage == "B-2-blend":
+        p = os.path.join(tmp_extract_dir, item["file_path_in_zip"])
+        if not os.path.exists(p):
+            return "", f"extract_failed:{p}"
+        return p, ""
+
+    if stage == "B-1-nested":
+        # Outer zip already extracted; now unwrap the inner zip.
+        inner_dest = os.path.join(tmp_extract_dir, "_b1_inner")
+        if not _extract_inner_zip(tmp_extract_dir, item["file_path_in_zip"], inner_dest):
+            return "", "b1_inner_extract_failed"
+        # Prefer the path the manifest already pinpointed, fallback to a re-scan.
+        hint = item.get("nested_inner_path", "")
+        if hint:
+            p = os.path.join(inner_dest, hint)
+            if os.path.exists(p):
+                return p, ""
+        p = _scan_for_main_model(inner_dest)
+        if not p:
+            return "", "b1_no_renderable_after_extract"
+        return p, ""
+
+    if stage == "B-3-archive":
+        kind = item.get("archive_kind", "")
+        archive_member = os.path.join(tmp_extract_dir, item["file_path_in_zip"])
+        if not os.path.isfile(archive_member):
+            return "", f"b3_archive_member_missing:{archive_member}"
+        dest = os.path.join(tmp_extract_dir, "_b3_extract")
+        if not _extract_archive(archive_member, kind, dest):
+            return "", f"b3_archive_extract_failed:{kind}"
+        if _scan_blend_only(dest):
+            return "", "b3_archive_only_blend_skipped"
+        p = _scan_for_main_model(dest)
+        if not p:
+            return "", "b3_no_renderable_in_archive"
+        return p, ""
+
+    return "", f"unknown_stage:{stage}"
+
+
 def load_manifest(manifest_path: str, local_state_dir: str) -> list:
     if _is_s3_uri(manifest_path):
         local = os.path.join(local_state_dir, "manifest.json")
@@ -348,6 +476,9 @@ def main():
     parser.add_argument("--blender_timeout_s", type=float, default=60 * 60 * 12,
                         help="Per-obj Blender timeout (default 12h).")
     parser.add_argument("--max_items", type=int, default=None, help="Limit obj count (debug).")
+    parser.add_argument("--stage_filter", type=str, default="",
+                        help="If non-empty, only render manifest entries whose stage matches "
+                             "(supports comma list e.g. 'B-1-nested,B-2-blend'). Empty = all.")
     parser.add_argument("--max_frames", type=int, default=121,
                         help="Per-obj animation frame cap, passed through to the Blender script.")
     parser.add_argument("--worker_tag", type=str, default="",
@@ -378,6 +509,12 @@ def main():
 
     manifest = load_manifest(args.manifest, args.state_dir)
     print(f"[batch] Loaded manifest with {len(manifest)} items")
+
+    if args.stage_filter:
+        wanted = {s.strip() for s in args.stage_filter.split(",") if s.strip()}
+        before = len(manifest)
+        manifest = [it for it in manifest if it.get("stage", "A") in wanted]
+        print(f"[batch] stage_filter={sorted(wanted)} kept {len(manifest)}/{before}")
 
     start = len(manifest) * args.rank // args.world_size
     end = len(manifest) * (args.rank + 1) // args.world_size
@@ -473,12 +610,15 @@ def main():
                 # `textures/*.png` referenced by the fbx/glb) are present.
                 zf.extractall(tmp_extract_dir)
 
-            extracted_path = os.path.join(tmp_extract_dir, file_path_in_zip)
-            if not os.path.exists(extracted_path):
-                msg = f"extraction failed: {extracted_path}"
-                print(f"  [SKIP] {msg}")
+            # Stage-aware: A returns the .fbx/.glb/.gltf path; B-1 unwraps an
+            # inner zip; B-2 returns the .blend path; B-3 shells out to 7z/unrar.
+            extracted_path, skip_reason = resolve_object_path(item, tmp_extract_dir)
+            if skip_reason:
+                print(f"  [SKIP/{item.get('stage','A')}] {skip_reason}")
                 for v in pending_views:
-                    progress.update_view(obj_id, v, _entry("extract_failed", error=msg), _line(obj_id, v, "extract_failed", error=msg))
+                    progress.update_view(obj_id, v,
+                        _entry("extract_failed", error=skip_reason),
+                        _line(obj_id, v, "extract_failed", error=skip_reason))
                 fail_obj += 1
                 continue
 

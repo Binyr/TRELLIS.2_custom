@@ -299,6 +299,23 @@ def init_scene() -> None:
         pass
 
 
+def _load_blend(filepath: str) -> None:
+    """Open a .blend by replacing the current scene, then strip its native
+    camera / light / world so the rest of the pipeline (which builds its own
+    deterministic cameras + uniform world + per-view random lights) starts
+    from a clean slate. Mesh objects, materials, modifiers, armatures, and
+    actions are preserved."""
+    bpy.ops.wm.open_mainfile(filepath=filepath)
+    for obj in list(bpy.data.objects):
+        if obj.type in ("CAMERA", "LIGHT"):
+            bpy.data.objects.remove(obj, do_unlink=True)
+    for w in list(bpy.data.worlds):
+        bpy.data.worlds.remove(w, do_unlink=True)
+
+
+IMPORT_FUNCTIONS["blend"] = _load_blend
+
+
 def load_object(object_path: str) -> None:
     file_extension = object_path.rsplit(".", 1)[-1].lower()
     if file_extension not in IMPORT_FUNCTIONS:
