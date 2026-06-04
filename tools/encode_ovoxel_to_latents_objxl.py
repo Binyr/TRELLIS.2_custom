@@ -47,6 +47,8 @@ import tarfile
 import tempfile
 import time
 import traceback
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -158,123 +160,163 @@ def _encode_ss(encoder, coords_enc, ss_resolution: int, device: str):
 # =====================================================================================
 
 
-def encode_one_view(
+# --- Pipeline stage 1: CPU IO ---------------------------------------------------
+#
+# Runs in a background thread. Pulls the tar from S3, extracts to /local-ssd,
+# parses every .vxz into CPU tensors. All side-effects live in `work_dir`, which
+# is handed off to the GPU stage so it can clean up after itself.
+
+
+def prepare_view(
     sha256: str,
     view_idx: int,
     s3_input_root: str,
-    s3_output_root: str,
     resolution: int,
-    ss_resolution: int,
     tmp_root: str,
-    shape_encoder,
-    ss_encoder,
-    device: str,
-    do_ss: bool = True,
-    frame_chunk_size: int = 8,
 ) -> dict:
     view_key = f"{sha256}/view_{view_idx:02d}"
     tar_uri = f"{s3_input_root.rstrip('/')}/{resolution}/{sha256}/view_{view_idx:02d}.tar"
-    out_uri = f"{s3_output_root.rstrip('/')}/{resolution}/{sha256}/view_{view_idx:02d}.npz"
 
     work_dir = os.path.join(tmp_root, sha256, f"view_{view_idx:02d}")
     if os.path.exists(work_dir):
         shutil.rmtree(work_dir, ignore_errors=True)
     os.makedirs(work_dir, exist_ok=True)
     local_tar = os.path.join(work_dir, f"view_{view_idx:02d}.tar")
-    local_npz = os.path.join(work_dir, f"view_{view_idx:02d}.npz")
 
-    t = {"t_get": 0.0, "t_extract": 0.0, "t_encode": 0.0,
-         "t_save_npz": 0.0, "t_upload_npz": 0.0}
+    out = {
+        "sha256": sha256,
+        "view_idx": view_idx,
+        "view_key": view_key,
+        "work_dir": work_dir,
+        "status": "prepared",
+        "frame_ids": [],
+        "loaded": [],
+        "t_get": 0.0,
+        "t_extract": 0.0,
+        "t_read": 0.0,
+        "error": None,
+    }
     try:
-        # 1) pull tar
         t0 = time.time()
         if not s3_get_file(tar_uri, local_tar, retries=2):
-            return _entry("missing_tar", view_key=view_key, num_frames=0, **t)
-        t["t_get"] = round(time.time() - t0, 2)
+            out["status"] = "missing_tar"
+            out["t_get"] = round(time.time() - t0, 2)
+            return out
+        out["t_get"] = round(time.time() - t0, 2)
 
-        # 2) extract
         t0 = time.time()
         with tarfile.open(local_tar) as tf:
             tf.extractall(work_dir)
         os.remove(local_tar)
         vxz_files = sorted(f for f in os.listdir(work_dir) if f.endswith(".vxz"))
-        t["t_extract"] = round(time.time() - t0, 2)
+        out["t_extract"] = round(time.time() - t0, 2)
         if not vxz_files:
-            return _entry("no_vxz", view_key=view_key, num_frames=0, **t)
+            out["status"] = "no_vxz"
+            return out
 
-        # 3) per-chunk encode (chunked shape encode, then per-frame SS if needed)
-        all_data = {"num_frames": np.int32(len(vxz_files))}
-        encoded = 0
         t0 = time.time()
-        last_failed = None
-        frame_ids = [os.path.splitext(n)[0] for n in vxz_files]
+        loaded = [_read_vxz_cpu(os.path.join(work_dir, n)) for n in vxz_files]
+        out["t_read"] = round(time.time() - t0, 2)
+        out["frame_ids"] = [os.path.splitext(n)[0] for n in vxz_files]
+        out["loaded"] = loaded
+        return out
+    except Exception as e:
+        out["status"] = "prepare_error"
+        out["error"] = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        return out
 
-        # Pre-load all .vxz to CPU (fast, sequential, /local-ssd).
-        loaded = []
-        for vxz_name in vxz_files:
-            loaded.append(_read_vxz_cpu(os.path.join(work_dir, vxz_name)))
 
-        cs = max(1, int(frame_chunk_size))
-        i = 0
-        while i < len(loaded):
-            chunk_items = loaded[i:i + cs]
-            chunk_fids = frame_ids[i:i + cs]
-            try:
-                outs = _encode_shape_chunk(shape_encoder, chunk_items, device)
-            except Exception as e_chunk:
-                # Fallback: re-do this chunk one frame at a time so a single bad
-                # frame doesn't kill the whole chunk.
-                if len(chunk_items) == 1:
-                    last_failed = chunk_fids[0]
-                    t["t_encode"] = round(time.time() - t0, 2)
-                    raise RuntimeError(f"frame {chunk_fids[0]}: {e_chunk}") from e_chunk
-                torch.cuda.empty_cache()
-                outs = []
-                for k, item in enumerate(chunk_items):
-                    try:
-                        outs.append(_encode_shape_chunk(shape_encoder, [item], device)[0])
-                    except Exception as e_single:
-                        last_failed = chunk_fids[k]
-                        t["t_encode"] = round(time.time() - t0, 2)
-                        raise RuntimeError(
-                            f"frame {chunk_fids[k]} (chunk fallback): {e_single}") from e_single
-            for fid, (feats, coords_enc) in zip(chunk_fids, outs):
-                all_data[f"shape_feats_{fid}"] = feats
-                all_data[f"shape_coords_{fid}"] = coords_enc
-                if do_ss:
-                    try:
-                        ss_z = _encode_ss(ss_encoder, coords_enc, ss_resolution, device)
-                    except Exception as e_ss:
-                        last_failed = fid
-                        t["t_encode"] = round(time.time() - t0, 2)
-                        raise RuntimeError(f"frame {fid} (ss): {e_ss}") from e_ss
-                    all_data[f"ss_z_{fid}"] = ss_z
-                encoded += 1
+# --- Pipeline stage 2: GPU encode (main thread) --------------------------------
+
+
+def gpu_encode_view(
+    prepared: dict,
+    ss_resolution: int,
+    shape_encoder,
+    ss_encoder,
+    device: str,
+    do_ss: bool,
+    frame_chunk_size: int,
+) -> tuple:
+    """Run shape (+ optional SS) encoding for one prepared view.
+
+    Returns (all_data, n_frames_encoded, t_encode_s, last_failed_frame_id).
+    Raises on encode failure (caller maps to encode_error)."""
+    loaded = prepared["loaded"]
+    frame_ids = prepared["frame_ids"]
+    all_data = {"num_frames": np.int32(len(loaded))}
+    encoded = 0
+    last_failed = None
+
+    cs = max(1, int(frame_chunk_size))
+    t0 = time.time()
+    i = 0
+    while i < len(loaded):
+        chunk_items = loaded[i:i + cs]
+        chunk_fids = frame_ids[i:i + cs]
+        try:
+            outs = _encode_shape_chunk(shape_encoder, chunk_items, device)
+        except Exception as e_chunk:
+            if len(chunk_items) == 1:
+                last_failed = chunk_fids[0]
+                raise RuntimeError(f"frame {chunk_fids[0]}: {e_chunk}") from e_chunk
             torch.cuda.empty_cache()
-            i += cs
-        t["t_encode"] = round(time.time() - t0, 2)
+            outs = []
+            for k, item in enumerate(chunk_items):
+                try:
+                    outs.append(_encode_shape_chunk(shape_encoder, [item], device)[0])
+                except Exception as e_single:
+                    last_failed = chunk_fids[k]
+                    raise RuntimeError(
+                        f"frame {chunk_fids[k]} (chunk fallback): {e_single}") from e_single
+        for fid, (feats, coords_enc) in zip(chunk_fids, outs):
+            all_data[f"shape_feats_{fid}"] = feats
+            all_data[f"shape_coords_{fid}"] = coords_enc
+            if do_ss:
+                try:
+                    ss_z = _encode_ss(ss_encoder, coords_enc, ss_resolution, device)
+                except Exception as e_ss:
+                    last_failed = fid
+                    raise RuntimeError(f"frame {fid} (ss): {e_ss}") from e_ss
+                all_data[f"ss_z_{fid}"] = ss_z
+            encoded += 1
+        torch.cuda.empty_cache()
+        i += cs
+    t_encode = round(time.time() - t0, 2)
+    return all_data, encoded, t_encode, last_failed
 
-        # 4) save npz local
+
+# --- Pipeline stage 3: save npz + upload (background thread) -------------------
+
+
+def save_and_upload(
+    work_dir: str,
+    sha256: str,
+    view_idx: int,
+    s3_output_root: str,
+    resolution: int,
+    all_data: dict,
+) -> dict:
+    """Write npz to /local-ssd, upload to S3, clean up work_dir.
+
+    Returns timings + a status overlay ('success' or 'upload_failed').
+    """
+    local_npz = os.path.join(work_dir, f"view_{view_idx:02d}.npz")
+    out_uri = f"{s3_output_root.rstrip('/')}/{resolution}/{sha256}/view_{view_idx:02d}.npz"
+    try:
         t0 = time.time()
         np.savez_compressed(local_npz, **all_data)
-        t["t_save_npz"] = round(time.time() - t0, 2)
-
-        # 5) upload npz
-        t0 = time.time()
-        if not s3_cp_file(local_npz, out_uri, retries=2):
-            return _entry("upload_failed", view_key=view_key, num_frames=encoded,
-                          failed_frame=last_failed, **t)
-        t["t_upload_npz"] = round(time.time() - t0, 2)
-
+        t_save = round(time.time() - t0, 2)
         npz_mb = round(os.path.getsize(local_npz) / (1024 * 1024), 2)
-        print(f"[timing] {sha256[:12]}/view_{view_idx:02d} "
-              f"frames={encoded} npz_mb={npz_mb} "
-              f"t_get={t['t_get']}s t_extract={t['t_extract']}s "
-              f"t_encode={t['t_encode']}s t_save={t['t_save_npz']}s "
-              f"t_upload={t['t_upload_npz']}s")
 
-        return _entry("success", view_key=view_key, num_frames=encoded,
-                      npz_mb=npz_mb, **t)
+        t0 = time.time()
+        ok = s3_cp_file(local_npz, out_uri, retries=2)
+        t_upload = round(time.time() - t0, 2)
+        if not ok:
+            return {"status": "upload_failed", "t_save_npz": t_save,
+                    "t_upload_npz": t_upload, "npz_mb": npz_mb}
+        return {"status": "success", "t_save_npz": t_save,
+                "t_upload_npz": t_upload, "npz_mb": npz_mb}
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -293,11 +335,13 @@ def encode_one_view(
 #   transient (retried on resume):
 #     missing_tar     `aws s3 cp` for the input tar returned non-zero
 #     upload_failed   `aws s3 cp` for the output npz returned non-zero
+#     prepare_error   tar extract / vxz read raised unexpectedly (almost
+#                     always a corrupt tar fetched mid-write, retried later)
 #
 # Every entry also carries an `attempts` counter so we can spot views that
 # stay transient for too long.
 TERMINAL_SKIP_STATUSES = {"success", "no_vxz", "encode_error"}
-TRANSIENT_STATUSES = {"missing_tar", "upload_failed"}
+TRANSIENT_STATUSES = {"missing_tar", "upload_failed", "prepare_error"}
 
 
 def main():
@@ -326,6 +370,10 @@ def main():
                         help="Number of frames batched into one shape-encoder forward. "
                              "On chunk failure the worker falls back to per-frame for "
                              "just that chunk so a single bad frame can't poison the view.")
+    parser.add_argument("--prefetch", type=int, default=4,
+                        help="Number of views to keep prepared in background threads. "
+                             "Higher values overlap S3/decode/CPU with GPU but use more "
+                             "/local-ssd space (each prepared view ~ tar + decoded vxz).")
     args = parser.parse_args()
 
     if not _is_s3_uri(args.s3_input_root):
@@ -401,68 +449,170 @@ def main():
         ss_encoder = None
         print(f"[main] resolution={args.resolution} <= 512 -> skipping SS encode")
 
+    # ---- pipelined prefetch loop ----
     n_ok = 0
     n_fail = 0
     t_start = time.time()
     total = len(to_process)
-    for i, (sha, vid) in enumerate(to_process):
-        t0 = time.time()
-        try:
-            with torch.no_grad():
-                result = encode_one_view(
-                    sha256=sha, view_idx=vid,
-                    s3_input_root=args.s3_input_root,
-                    s3_output_root=args.s3_output_root,
-                    resolution=args.resolution,
-                    ss_resolution=args.ss_resolution,
-                    tmp_root=args.tmp_dir,
-                    shape_encoder=shape_encoder,
-                    ss_encoder=ss_encoder,
-                    device=device,
-                    do_ss=do_ss,
-                    frame_chunk_size=args.frame_chunk_size,
-                )
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"[error] {sha}/view_{vid:02d}: {e}\n{tb}")
-            upload_error_log(args.s3_output_root, args.rank, sha, vid,
-                             header=str(e), exc=e)
-            result = _entry("encode_error", view_key=f"{sha}/view_{vid:02d}",
-                            error=str(e)[:500])
 
-        # carry forward an attempts counter so re-trying transient failures is visible
+    # Two pools: prepare (CPU-heavy, S3 download + tar extract + vxz parse) and
+    # save (CPU + S3 upload). Both stages release the GIL inside aws/tarfile/o_voxel,
+    # so threads are fine.
+    prep_pool = ThreadPoolExecutor(max_workers=max(1, args.prefetch),
+                                   thread_name_prefix="prep")
+    save_pool = ThreadPoolExecutor(max_workers=max(1, args.prefetch),
+                                   thread_name_prefix="save")
+
+    prep_queue = deque()  # of (idx, sha, vid, future)
+    save_inflight = []    # of (idx, sha, vid, future, t_view_start)
+    cursor = 0
+
+    def schedule_next():
+        nonlocal cursor
+        while len(prep_queue) < max(1, args.prefetch) and cursor < total:
+            sha, vid = to_process[cursor]
+            fut = prep_pool.submit(
+                prepare_view, sha, vid,
+                args.s3_input_root, args.resolution, args.tmp_dir,
+            )
+            prep_queue.append((cursor, sha, vid, fut, time.time()))
+            cursor += 1
+
+    def finalize_result(sha, vid, result, t_view_start):
+        nonlocal n_ok, n_fail
         view_key = f"{sha}/view_{int(vid):02d}"
         prev_attempts = (progress.progress.get(view_key, {}) or {}).get("attempts", 0)
         result["attempts"] = int(prev_attempts) + 1
 
-        dt = time.time() - t0
+        dt = time.time() - t_view_start
         st = result.get("status", "?")
         if st == "success":
             n_ok += 1
         else:
             n_fail += 1
-            # Soft failures from encode_one_view itself (missing_tar / no_vxz /
-            # upload_failed) won't have a python traceback, dump the result dict
-            # instead so the S3 _logs entry is still useful.
             if st != "encode_error":
                 upload_error_log(args.s3_output_root, args.rank, sha, vid,
                                  header=f"soft_failure:{st}",
                                  extra_tb=json.dumps(result, default=str, indent=2))
 
         rate = (n_ok + n_fail) / max(1e-6, time.time() - t_start)
-        eta_min = (total - (i + 1)) / max(1e-6, rate) / 60.0
+        eta_min = (total - (n_ok + n_fail)) / max(1e-6, rate) / 60.0
         progress.update(
             sha, vid, result,
             _line(sha, vid, st, dt=f"{dt:.1f}s",
                   ok=n_ok, fail=n_fail, rate=f"{rate:.2f}/s",
                   eta_min=f"{eta_min:.1f}"),
         )
-        print(f"[main] [{i+1}/{total}] {sha}/view_{vid:02d} {st} dt={dt:.1f}s "
-              f"| ok={n_ok} fail={n_fail} rate={rate:.2f} view/s eta={eta_min:.1f}min")
+        print(f"[main] {sha}/view_{vid:02d} {st} dt={dt:.1f}s "
+              f"| ok={n_ok} fail={n_fail} of {total} rate={rate:.2f} view/s "
+              f"eta={eta_min:.1f}min  | prep_q={len(prep_queue)} save_q={len(save_inflight)}")
+
+    try:
+        schedule_next()
+        processed = 0
+        while processed < total:
+            # Drain any finished save futures (non-blocking-ish: check tip first).
+            new_save = []
+            for idx, sha, vid, fut, t_view_start, entry in save_inflight:
+                if fut.done():
+                    so = fut.result()
+                    entry["status"] = so["status"]
+                    for k in ("t_save_npz", "t_upload_npz", "npz_mb"):
+                        if k in so:
+                            entry[k] = so[k]
+                    print(f"[timing] {sha[:12]}/view_{vid:02d} frames={entry.get('num_frames','?')} "
+                          f"npz_mb={entry.get('npz_mb','?')} "
+                          f"t_get={entry.get('t_get','?')}s t_extract={entry.get('t_extract','?')}s "
+                          f"t_read={entry.get('t_read','?')}s t_encode={entry.get('t_encode','?')}s "
+                          f"t_save={entry.get('t_save_npz','?')}s t_upload={entry.get('t_upload_npz','?')}s")
+                    finalize_result(sha, vid, entry, t_view_start)
+                    processed += 1
+                else:
+                    new_save.append((idx, sha, vid, fut, t_view_start, entry))
+            save_inflight[:] = new_save
+
+            if not prep_queue:
+                # GPU starved -- everything drained, wait for any save to finish.
+                if save_inflight:
+                    time.sleep(0.05)
+                    continue
+                break
+
+            idx, sha, vid, fut, t_view_start = prep_queue.popleft()
+            t_wait0 = time.time()
+            prepared = fut.result()  # blocks if prep hasn't finished
+            t_wait = round(time.time() - t_wait0, 2)
+            schedule_next()  # keep the prep pipeline full
+
+            # Failed/skipped views: don't touch GPU, write entry directly.
+            if prepared["status"] != "prepared":
+                st = prepared["status"]
+                if st == "prepare_error" and prepared.get("error"):
+                    upload_error_log(args.s3_output_root, args.rank, sha, vid,
+                                     header="prepare_error",
+                                     extra_tb=prepared["error"])
+                entry = _entry(st, view_key=prepared["view_key"], num_frames=0,
+                               t_get=prepared["t_get"], t_extract=prepared["t_extract"],
+                               t_read=prepared.get("t_read", 0.0), t_wait_prep=t_wait)
+                shutil.rmtree(prepared["work_dir"], ignore_errors=True)
+                finalize_result(sha, vid, entry, t_view_start)
+                processed += 1
+                continue
+
+            # GPU encode (in main thread).
+            try:
+                with torch.no_grad():
+                    all_data, encoded, t_encode, last_failed = gpu_encode_view(
+                        prepared, args.ss_resolution, shape_encoder, ss_encoder,
+                        device, do_ss, args.frame_chunk_size,
+                    )
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"[error] {sha}/view_{vid:02d}: {e}\n{tb}")
+                upload_error_log(args.s3_output_root, args.rank, sha, vid,
+                                 header=str(e), exc=e)
+                shutil.rmtree(prepared["work_dir"], ignore_errors=True)
+                entry = _entry("encode_error", view_key=prepared["view_key"],
+                               error=str(e)[:500],
+                               t_get=prepared["t_get"], t_extract=prepared["t_extract"],
+                               t_read=prepared["t_read"], t_wait_prep=t_wait)
+                finalize_result(sha, vid, entry, t_view_start)
+                processed += 1
+                continue
+
+            # Hand off save+upload to background.
+            entry = _entry("uploading", view_key=prepared["view_key"], num_frames=encoded,
+                           t_get=prepared["t_get"], t_extract=prepared["t_extract"],
+                           t_read=prepared["t_read"], t_encode=t_encode, t_wait_prep=t_wait,
+                           failed_frame=last_failed)
+            save_fut = save_pool.submit(
+                save_and_upload,
+                prepared["work_dir"], sha, vid,
+                args.s3_output_root, args.resolution, all_data,
+            )
+            save_inflight.append((idx, sha, vid, save_fut, t_view_start, entry))
+    finally:
+        prep_pool.shutdown(wait=True)
+        save_pool.shutdown(wait=True)
+
+    # Drain any final saves that completed during shutdown.
+    for idx, sha, vid, fut, t_view_start, entry in save_inflight:
+        try:
+            so = fut.result()
+            entry["status"] = so["status"]
+            for k in ("t_save_npz", "t_upload_npz", "npz_mb"):
+                if k in so:
+                    entry[k] = so[k]
+            print(f"[timing] {sha[:12]}/view_{vid:02d} frames={entry.get('num_frames','?')} "
+                  f"npz_mb={entry.get('npz_mb','?')} (post-shutdown)")
+        except Exception as e:
+            entry["status"] = "upload_failed"
+            entry["error"] = str(e)[:500]
+        finalize_result(sha, vid, entry, t_view_start)
 
     progress.flush()
     print(f"\n[main] DONE rank={args.rank} ok={n_ok} fail={n_fail} "
-          f"elapsed={ (time.time() - t_start)/60.0:.1f}min")
+          f"elapsed={(time.time() - t_start)/60.0:.1f}min")
 
 
 if __name__ == "__main__":

@@ -7,9 +7,10 @@
 #
 # Usage: bash shs/trellis.2/encode_objxl_4d_latents.sh [world_size] [rank]
 # Env (optional): MAX_ITEMS, RESOLUTION, SS_RESOLUTION, FRAME_CHUNK_SIZE,
-#                 STDOUT_SYNC_INTERVAL (seconds, default 60)
+#                 PREFETCH, STDOUT_SYNC_INTERVAL (seconds, default 60)
 # Set FRAME_CHUNK_SIZE=1 to fall back to one-frame-per-forward (bit-exact
 # vs. the original single-frame implementation).
+# PREFETCH=N keeps N views in background CPU/IO pipeline so GPU stays busy.
 
 set -uo pipefail
 export LANG=C.UTF-8
@@ -30,6 +31,7 @@ S3_OUTPUT="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/ob
 RESOLUTION="${RESOLUTION:-512}"
 SS_RESOLUTION="${SS_RESOLUTION:-32}"
 FRAME_CHUNK_SIZE="${FRAME_CHUNK_SIZE:-8}"
+PREFETCH="${PREFETCH:-4}"
 MAX_ITEMS_ARG=()
 if [[ -n "${MAX_ITEMS:-}" ]]; then
     MAX_ITEMS_ARG=(--max_items "$MAX_ITEMS")
@@ -87,6 +89,7 @@ echo "  s3_input_root     = $S3_INPUT"
 echo "  s3_output_root    = $S3_OUTPUT"
 echo "  max_items         = ${MAX_ITEMS:-<unset>}"
 echo "  frame_chunk_size  = $FRAME_CHUNK_SIZE"
+echo "  prefetch          = $PREFETCH"
 echo "  local_log         = $LOCAL_LOG"
 echo "  s3_log            = $S3_STDOUT_LOG  (sync every ${STDOUT_SYNC_INTERVAL}s)"
 echo "================================================================"
@@ -100,6 +103,7 @@ python -u tools/encode_ovoxel_to_latents_objxl.py \
     --resolution        "$RESOLUTION" \
     --ss_resolution     "$SS_RESOLUTION" \
     --frame_chunk_size  "$FRAME_CHUNK_SIZE" \
+    --prefetch          "$PREFETCH" \
     --state_dir /local-ssd/encode_objxl_state \
     --tmp_dir   /local-ssd/encode_objxl_tmp \
     --world_size "$WS" --rank "$RANK" \
