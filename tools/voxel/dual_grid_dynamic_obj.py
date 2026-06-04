@@ -259,7 +259,8 @@ def load_finished_views(path_or_uri: str, local_cache_path: str) -> list:
     return out
 
 
-def summarize_finished_views_from_logs(logs_prefix: str, local_cache_dir: str) -> list:
+def summarize_finished_views_from_logs(logs_prefix: str, local_cache_dir: str,
+                                       filename_prefix: str = "progress_") -> list:
     """Dynamically scan progress_*.json under logs_prefix and return the same
     list shape as load_finished_views (list of (sha, view_idx) tuples).
 
@@ -282,12 +283,12 @@ def summarize_finished_views_from_logs(logs_prefix: str, local_cache_dir: str) -
         if len(parts) < 4:
             continue
         name = parts[-1]
-        if name.startswith("progress_") and name.endswith(".json"):
+        if name.startswith(filename_prefix) and name.endswith(".json"):
             uris.append(logs_prefix + name)
     uris.sort()
-    print(f"[manifest:dyn] found {len(uris)} progress_*.json under {logs_prefix}")
+    print(f"[manifest:dyn] found {len(uris)} {filename_prefix}*.json under {logs_prefix}")
     if not uris:
-        raise RuntimeError(f"No progress_*.json under {logs_prefix}")
+        raise RuntimeError(f"No {filename_prefix}*.json under {logs_prefix}")
 
     def _dl(uri):
         local = os.path.join(local_cache_dir, uri.rsplit("/", 1)[-1])
