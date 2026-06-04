@@ -202,8 +202,8 @@ def encode_one_view(
         # 5) upload npz
         t0 = time.time()
         if not s3_cp_file(local_npz, out_uri, retries=2):
-            return _entry("error", view_key=view_key, num_frames=encoded,
-                          error="upload_failed", failed_frame=last_failed, **t)
+            return _entry("upload_failed", view_key=view_key, num_frames=encoded,
+                          failed_frame=last_failed, **t)
         t["t_upload_npz"] = round(time.time() - t0, 2)
 
         npz_mb = round(os.path.getsize(local_npz) / (1024 * 1024), 2)
@@ -224,12 +224,20 @@ def encode_one_view(
 # =====================================================================================
 
 
-# Skip any view whose progress entry has one of these statuses on restart.
-# We treat failures as terminal too: if a view broke once it will almost always
-# break the same way (corrupted tar, OOM on giant frame, etc.); re-trying just
-# wastes GPU time. To force a retry, delete the corresponding entry in
-# encode_progress_<rank>.json (or delete the whole file).
-TERMINAL_SKIP_STATUSES = {"success", "error", "missing_tar", "no_vxz"}
+# Status taxonomy:
+#   permanent (terminal -> skipped on resume):
+#     success         OK
+#     no_vxz          tar opened fine but had no .vxz inside (bad data)
+#     encode_error    a frame raised inside the encoder -- almost always a
+#                     bad voxel / encoder math problem, not transient
+#   transient (retried on resume):
+#     missing_tar     `aws s3 cp` for the input tar returned non-zero
+#     upload_failed   `aws s3 cp` for the output npz returned non-zero
+#
+# Every entry also carries an `attempts` counter so we can spot views that
+# stay transient for too long.
+TERMINAL_SKIP_STATUSES = {"success", "no_vxz", "encode_error"}
+TRANSIENT_STATUSES = {"missing_tar", "upload_failed"}
 
 
 def main():
@@ -295,10 +303,18 @@ def main():
     def _done(sha, vid):
         return progress.progress.get(f"{sha}/view_{int(vid):02d}", {}).get("status") in TERMINAL_SKIP_STATUSES
 
+    # Summarize the existing progress.json for visibility.
+    from collections import Counter as _Counter
+    prior_status = _Counter(
+        (entry or {}).get("status", "?") for entry in progress.progress.values()
+        if isinstance(entry, dict)
+    )
+    print(f"[main] prior progress entries by status: {dict(prior_status)}")
+
     to_process = [(s, v) for s, v in my_tasks if not _done(s, v)]
     skipped = len(my_tasks) - len(to_process)
-    print(f"[main] terminal (success/error/missing_tar/no_vxz) in progress: "
-          f"{skipped}; to process: {len(to_process)}")
+    print(f"[main] terminal in progress (skip): {skipped}; "
+          f"to process (incl. retried transient): {len(to_process)}")
 
     if args.max_items is not None:
         to_process = to_process[: args.max_items]
@@ -346,8 +362,13 @@ def main():
             print(f"[error] {sha}/view_{vid:02d}: {e}\n{tb}")
             upload_error_log(args.s3_output_root, args.rank, sha, vid,
                              header=str(e), exc=e)
-            result = _entry("error", view_key=f"{sha}/view_{vid:02d}",
+            result = _entry("encode_error", view_key=f"{sha}/view_{vid:02d}",
                             error=str(e)[:500])
+
+        # carry forward an attempts counter so re-trying transient failures is visible
+        view_key = f"{sha}/view_{int(vid):02d}"
+        prev_attempts = (progress.progress.get(view_key, {}) or {}).get("attempts", 0)
+        result["attempts"] = int(prev_attempts) + 1
 
         dt = time.time() - t0
         st = result.get("status", "?")
@@ -358,7 +379,7 @@ def main():
             # Soft failures from encode_one_view itself (missing_tar / no_vxz /
             # upload_failed) won't have a python traceback, dump the result dict
             # instead so the S3 _logs entry is still useful.
-            if st not in ("success",) and "exc" not in result:
+            if st != "encode_error":
                 upload_error_log(args.s3_output_root, args.rank, sha, vid,
                                  header=f"soft_failure:{st}",
                                  extra_tb=json.dumps(result, default=str, indent=2))
