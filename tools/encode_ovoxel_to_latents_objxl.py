@@ -224,7 +224,12 @@ def encode_one_view(
 # =====================================================================================
 
 
-TERMINAL_SKIP_STATUSES = {"success"}
+# Skip any view whose progress entry has one of these statuses on restart.
+# We treat failures as terminal too: if a view broke once it will almost always
+# break the same way (corrupted tar, OOM on giant frame, etc.); re-trying just
+# wastes GPU time. To force a retry, delete the corresponding entry in
+# encode_progress_<rank>.json (or delete the whole file).
+TERMINAL_SKIP_STATUSES = {"success", "error", "missing_tar", "no_vxz"}
 
 
 def main():
@@ -292,7 +297,8 @@ def main():
 
     to_process = [(s, v) for s, v in my_tasks if not _done(s, v)]
     skipped = len(my_tasks) - len(to_process)
-    print(f"[main] success in progress: {skipped}; to process: {len(to_process)}")
+    print(f"[main] terminal (success/error/missing_tar/no_vxz) in progress: "
+          f"{skipped}; to process: {len(to_process)}")
 
     if args.max_items is not None:
         to_process = to_process[: args.max_items]
