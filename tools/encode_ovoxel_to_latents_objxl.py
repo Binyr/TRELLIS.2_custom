@@ -134,6 +134,7 @@ def encode_one_view(
     shape_encoder,
     ss_encoder,
     device: str,
+    do_ss: bool = True,
 ) -> dict:
     view_key = f"{sha256}/view_{view_idx:02d}"
     tar_uri = f"{s3_input_root.rstrip('/')}/{resolution}/{sha256}/view_{view_idx:02d}.tar"
@@ -177,13 +178,15 @@ def encode_one_view(
                 vertices, intersected = _load_vxz(vxz_path, device)
                 try:
                     feats, coords_enc = _encode_shape(shape_encoder, vertices, intersected)
-                    ss_z = _encode_ss(ss_encoder, coords_enc, ss_resolution, device)
+                    if do_ss:
+                        ss_z = _encode_ss(ss_encoder, coords_enc, ss_resolution, device)
                 finally:
                     del vertices, intersected
                     torch.cuda.empty_cache()
                 all_data[f"shape_feats_{frame_id}"] = feats
                 all_data[f"shape_coords_{frame_id}"] = coords_enc
-                all_data[f"ss_z_{frame_id}"] = ss_z
+                if do_ss:
+                    all_data[f"ss_z_{frame_id}"] = ss_z
                 encoded += 1
             except Exception as e:
                 last_failed = frame_id
@@ -302,10 +305,15 @@ def main():
     # Models.
     device = "cuda:0"
     torch.cuda.set_device(0)
+    do_ss = args.resolution > 512
     print(f"[main] loading shape encoder: {args.shape_enc_pretrained}")
     shape_encoder = models.from_pretrained(args.shape_enc_pretrained).eval().to(device)
-    print(f"[main] loading ss    encoder: {args.ss_enc_pretrained}")
-    ss_encoder = models.from_pretrained(args.ss_enc_pretrained).eval().to(device)
+    if do_ss:
+        print(f"[main] loading ss    encoder: {args.ss_enc_pretrained}")
+        ss_encoder = models.from_pretrained(args.ss_enc_pretrained).eval().to(device)
+    else:
+        ss_encoder = None
+        print(f"[main] resolution={args.resolution} <= 512 -> skipping SS encode")
 
     n_ok = 0
     n_fail = 0
@@ -325,6 +333,7 @@ def main():
                     shape_encoder=shape_encoder,
                     ss_encoder=ss_encoder,
                     device=device,
+                    do_ss=do_ss,
                 )
         except Exception as e:
             tb = traceback.format_exc()
