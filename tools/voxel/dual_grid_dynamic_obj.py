@@ -260,9 +260,18 @@ def load_finished_views(path_or_uri: str, local_cache_path: str) -> list:
 
 
 def summarize_finished_views_from_logs(logs_prefix: str, local_cache_dir: str,
-                                       filename_prefix: str = "progress_") -> list:
+                                       filename_prefix: str = "progress_",
+                                       statuses: tuple = ("success",),
+                                       missing_ok: bool = False) -> list:
     """Dynamically scan progress_*.json under logs_prefix and return the same
     list shape as load_finished_views (list of (sha, view_idx) tuples).
+
+    statuses     -- which status values count as "finished" (default: success).
+                    Pass e.g. ("success", "no_vxz", "encode_error") to include
+                    terminal failures so they're skipped cross-rank too.
+    missing_ok   -- if True, return [] when no matching json files exist
+                    instead of raising (useful when this prefix is the encode
+                    stage's own progress dir on first run).
 
     Mirrors `tools/voxel/build_render_finished_views.py` but inlined so the
     voxel worker can re-summarize at startup without depending on a stale
@@ -272,10 +281,14 @@ def summarize_finished_views_from_logs(logs_prefix: str, local_cache_dir: str,
     if not logs_prefix.endswith("/"):
         logs_prefix = logs_prefix + "/"
     os.makedirs(local_cache_dir, exist_ok=True)
+    status_set = set(statuses)
 
     # List progress_*.json under the prefix.
     proc = run_aws(["s3", "ls", logs_prefix], retries=2)
     if proc.returncode != 0:
+        if missing_ok:
+            print(f"[manifest:dyn] aws s3 ls failed for {logs_prefix} (missing_ok) -> []")
+            return []
         raise RuntimeError(f"aws s3 ls failed for {logs_prefix}: {proc.stderr.strip()[:300]}")
     uris = []
     for line in proc.stdout.splitlines():
@@ -288,6 +301,8 @@ def summarize_finished_views_from_logs(logs_prefix: str, local_cache_dir: str,
     uris.sort()
     print(f"[manifest:dyn] found {len(uris)} {filename_prefix}*.json under {logs_prefix}")
     if not uris:
+        if missing_ok:
+            return []
         raise RuntimeError(f"No {filename_prefix}*.json under {logs_prefix}")
 
     def _dl(uri):
@@ -295,7 +310,7 @@ def summarize_finished_views_from_logs(logs_prefix: str, local_cache_dir: str,
         ok = s3_get_file(uri, local, retries=2)
         return uri, local, ok
 
-    success_keys = set()
+    matched_keys = set()
     status_counter = {}
     failed_dl = 0
     failed_parse = 0
@@ -317,16 +332,16 @@ def summarize_finished_views_from_logs(logs_prefix: str, local_cache_dir: str,
             for view_key, entry in d.items():
                 st = (entry or {}).get("status", "unknown") if isinstance(entry, dict) else "unknown"
                 status_counter[st] = status_counter.get(st, 0) + 1
-                if st == "success":
-                    success_keys.add(view_key)
+                if st in status_set:
+                    matched_keys.add(view_key)
 
     print(f"[manifest:dyn] download ok={len(uris)-failed_dl} failed={failed_dl} "
           f"parse_failed={failed_parse}")
     print(f"[manifest:dyn] aggregate status counts (NOT deduped across ranks): {status_counter}")
-    print(f"[manifest:dyn] unique success views: {len(success_keys)}")
+    print(f"[manifest:dyn] unique matched views (statuses={sorted(status_set)}): {len(matched_keys)}")
 
     out, bad = [], 0
-    for key in success_keys:
+    for key in matched_keys:
         try:
             sha, view = key.split("/")
             assert view.startswith("view_")

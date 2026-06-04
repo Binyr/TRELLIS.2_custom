@@ -451,13 +451,34 @@ def main():
     all_tasks.sort()
     print(f"[main] voxel-success views: {len(all_tasks)}")
 
-    # shard
+    # ---- Cross-rank skip ----
+    # Pull every encode_progress_*.json that any rank has written so far and
+    # subtract terminal-status views from the global task pool BEFORE sharding.
+    # This way, if world_size changes between launches (or a rank is
+    # re-submitted), no rank re-encodes work another rank has already done.
+    cross_cache = os.path.join(args.state_dir, "cross_rank_progress_cache")
+    encode_logs_prefix = f"{args.s3_output_root.rstrip('/')}/logs/"
+    cross_done = summarize_finished_views_from_logs(
+        encode_logs_prefix, cross_cache,
+        filename_prefix="encode_progress_",
+        statuses=tuple(TERMINAL_SKIP_STATUSES),
+        missing_ok=True,
+    )
+    cross_done_set = set(cross_done)
+    n_global = len(all_tasks)
+    all_tasks = [t for t in all_tasks if t not in cross_done_set]
+    print(f"[main] cross-rank terminal views to skip globally: {len(cross_done_set)} "
+          f"(of {n_global} -> {len(all_tasks)} remaining)")
+
+    # Shard the *remaining* task pool. Slice indexing is therefore not stable
+    # across launches by design -- whatever's left gets re-divided.
     start = len(all_tasks) * args.rank // args.world_size
     end = len(all_tasks) * (args.rank + 1) // args.world_size
     my_tasks = all_tasks[start:end]
     print(f"[main] rank {args.rank}: {len(my_tasks)} tasks (idx {start}:{end})")
 
-    # L2: per-rank progress.
+    # L2: per-rank progress (for retried-transient handling and per-rank
+    # bookkeeping; cross-rank skip already excluded global terminals).
     progress = ProgressStore(args.s3_output_root, args.rank, args.state_dir)
     # rename the per-rank progress URIs so they don't collide with voxel-stage files.
     progress.s3_progress_uri = (
@@ -481,7 +502,7 @@ def main():
 
     to_process = [(s, v) for s, v in my_tasks if not _done(s, v)]
     skipped = len(my_tasks) - len(to_process)
-    print(f"[main] terminal in progress (skip): {skipped}; "
+    print(f"[main] this-rank terminal in progress (additional skip): {skipped}; "
           f"to process (incl. retried transient): {len(to_process)}")
 
     if args.max_items is not None:
