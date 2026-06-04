@@ -76,28 +76,63 @@ from tools.voxel.dual_grid_dynamic_obj import (  # noqa: E402
 # =====================================================================================
 
 
-def _load_vxz(vxz_path: str, device: str):
+def _read_vxz_cpu(vxz_path: str):
+    """Read one .vxz file into CPU tensors (no GPU touch, no SparseTensor)."""
     coords, attr = o_voxel.io.read_vxz(vxz_path, num_threads=4)
+    return coords, attr
+
+
+def _build_sparse_chunk(items, device):
+    """Stack a list of per-frame (coords, attr) into a single batched SparseTensor pair.
+
+    items: list of (coords_cpu, attr_cpu) tuples; index in list -> batch_idx.
+    Returns (vertices, intersected) SparseTensors on `device`.
+    """
+    vert_feats = []
+    inter_feats = []
+    bcoords_list = []
+    for b, (coords, attr) in enumerate(items):
+        n = coords.shape[0]
+        batch_col = torch.full((n, 1), b, dtype=coords.dtype)
+        bcoords_list.append(torch.cat([batch_col, coords], dim=-1))
+        vert_feats.append((attr['vertices'] / 255.0).float())
+        ic = attr['intersected']
+        inter_feats.append(torch.cat([ic % 2, ic // 2 % 2, ic // 4 % 2], dim=-1).bool())
+
+    coords_cat = torch.cat(bcoords_list, dim=0)
     vertices = sp.SparseTensor(
-        (attr['vertices'] / 255.0).float(),
-        torch.cat([torch.zeros_like(coords[:, 0:1]), coords], dim=-1),
+        torch.cat(vert_feats, dim=0),
+        coords_cat,
     )
-    intersected = vertices.replace(torch.cat([
-        attr['intersected'] % 2,
-        attr['intersected'] // 2 % 2,
-        attr['intersected'] // 4 % 2,
-    ], dim=-1).bool())
+    intersected = vertices.replace(torch.cat(inter_feats, dim=0))
     return vertices.to(device), intersected.to(device)
 
 
-def _encode_shape(encoder, vertices, intersected):
-    z = encoder(vertices, intersected)
-    torch.cuda.synchronize()
-    if not torch.isfinite(z.feats).all():
-        raise ValueError("Non-finite values in shape latent")
-    feats = z.feats.detach().cpu().numpy().astype(np.float32)
-    coords = z.coords[:, 1:].detach().cpu().numpy().astype(np.uint8)
-    return feats, coords
+def _encode_shape_chunk(encoder, items, device):
+    """Encode a chunk of frames in one forward. Returns list of (feats_np, coords_np)
+    aligned with `items`."""
+    if len(items) == 1:
+        # path-of-least-resistance for fallback
+        vertices, intersected = _build_sparse_chunk(items, device)
+    else:
+        vertices, intersected = _build_sparse_chunk(items, device)
+    try:
+        z = encoder(vertices, intersected)
+        torch.cuda.synchronize()
+        if not torch.isfinite(z.feats).all():
+            raise ValueError("Non-finite values in shape latent")
+        feats_all = z.feats.detach().cpu().numpy().astype(np.float32)
+        coords_all = z.coords.detach().cpu().numpy()  # uint? long; col0 = batch
+    finally:
+        del vertices, intersected
+    out = []
+    batch_col = coords_all[:, 0]
+    for b in range(len(items)):
+        mask = batch_col == b
+        feats = feats_all[mask]
+        coords = coords_all[mask, 1:].astype(np.uint8)
+        out.append((feats, coords))
+    return out
 
 
 def _encode_ss(encoder, coords_enc, ss_resolution: int, device: str):
@@ -135,6 +170,7 @@ def encode_one_view(
     ss_encoder,
     device: str,
     do_ss: bool = True,
+    frame_chunk_size: int = 8,
 ) -> dict:
     view_key = f"{sha256}/view_{view_idx:02d}"
     tar_uri = f"{s3_input_root.rstrip('/')}/{resolution}/{sha256}/view_{view_idx:02d}.tar"
@@ -166,32 +202,56 @@ def encode_one_view(
         if not vxz_files:
             return _entry("no_vxz", view_key=view_key, num_frames=0, **t)
 
-        # 3) per-frame encode
+        # 3) per-chunk encode (chunked shape encode, then per-frame SS if needed)
         all_data = {"num_frames": np.int32(len(vxz_files))}
         encoded = 0
         t0 = time.time()
         last_failed = None
+        frame_ids = [os.path.splitext(n)[0] for n in vxz_files]
+
+        # Pre-load all .vxz to CPU (fast, sequential, /local-ssd).
+        loaded = []
         for vxz_name in vxz_files:
-            frame_id = os.path.splitext(vxz_name)[0]
-            vxz_path = os.path.join(work_dir, vxz_name)
+            loaded.append(_read_vxz_cpu(os.path.join(work_dir, vxz_name)))
+
+        cs = max(1, int(frame_chunk_size))
+        i = 0
+        while i < len(loaded):
+            chunk_items = loaded[i:i + cs]
+            chunk_fids = frame_ids[i:i + cs]
             try:
-                vertices, intersected = _load_vxz(vxz_path, device)
-                try:
-                    feats, coords_enc = _encode_shape(shape_encoder, vertices, intersected)
-                    if do_ss:
-                        ss_z = _encode_ss(ss_encoder, coords_enc, ss_resolution, device)
-                finally:
-                    del vertices, intersected
-                    torch.cuda.empty_cache()
-                all_data[f"shape_feats_{frame_id}"] = feats
-                all_data[f"shape_coords_{frame_id}"] = coords_enc
+                outs = _encode_shape_chunk(shape_encoder, chunk_items, device)
+            except Exception as e_chunk:
+                # Fallback: re-do this chunk one frame at a time so a single bad
+                # frame doesn't kill the whole chunk.
+                if len(chunk_items) == 1:
+                    last_failed = chunk_fids[0]
+                    t["t_encode"] = round(time.time() - t0, 2)
+                    raise RuntimeError(f"frame {chunk_fids[0]}: {e_chunk}") from e_chunk
+                torch.cuda.empty_cache()
+                outs = []
+                for k, item in enumerate(chunk_items):
+                    try:
+                        outs.append(_encode_shape_chunk(shape_encoder, [item], device)[0])
+                    except Exception as e_single:
+                        last_failed = chunk_fids[k]
+                        t["t_encode"] = round(time.time() - t0, 2)
+                        raise RuntimeError(
+                            f"frame {chunk_fids[k]} (chunk fallback): {e_single}") from e_single
+            for fid, (feats, coords_enc) in zip(chunk_fids, outs):
+                all_data[f"shape_feats_{fid}"] = feats
+                all_data[f"shape_coords_{fid}"] = coords_enc
                 if do_ss:
-                    all_data[f"ss_z_{frame_id}"] = ss_z
+                    try:
+                        ss_z = _encode_ss(ss_encoder, coords_enc, ss_resolution, device)
+                    except Exception as e_ss:
+                        last_failed = fid
+                        t["t_encode"] = round(time.time() - t0, 2)
+                        raise RuntimeError(f"frame {fid} (ss): {e_ss}") from e_ss
+                    all_data[f"ss_z_{fid}"] = ss_z
                 encoded += 1
-            except Exception as e:
-                last_failed = frame_id
-                t["t_encode"] = round(time.time() - t0, 2)
-                raise RuntimeError(f"frame {frame_id}: {e}") from e
+            torch.cuda.empty_cache()
+            i += cs
         t["t_encode"] = round(time.time() - t0, 2)
 
         # 4) save npz local
@@ -262,6 +322,10 @@ def main():
     parser.add_argument("--state_dir", type=str, default="/local-ssd/encode_objxl_state")
     parser.add_argument("--tmp_dir", type=str, default="/local-ssd/encode_objxl_tmp")
     parser.add_argument("--max_items", type=int, default=None)
+    parser.add_argument("--frame_chunk_size", type=int, default=8,
+                        help="Number of frames batched into one shape-encoder forward. "
+                             "On chunk failure the worker falls back to per-frame for "
+                             "just that chunk so a single bad frame can't poison the view.")
     args = parser.parse_args()
 
     if not _is_s3_uri(args.s3_input_root):
@@ -356,6 +420,7 @@ def main():
                     ss_encoder=ss_encoder,
                     device=device,
                     do_ss=do_ss,
+                    frame_chunk_size=args.frame_chunk_size,
                 )
         except Exception as e:
             tb = traceback.format_exc()
