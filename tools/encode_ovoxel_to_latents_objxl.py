@@ -84,57 +84,78 @@ def _read_vxz_cpu(vxz_path: str):
     return coords, attr
 
 
-def _build_sparse_chunk(items, device):
-    """Stack a list of per-frame (coords, attr) into a single batched SparseTensor pair.
+def _build_chunk_cpu(items, pin_memory: bool = True):
+    """CPU-side cat + (optional) pin. Safe to call from any thread.
 
-    items: list of (coords_cpu, attr_cpu) tuples; index in list -> batch_idx.
-    Returns (vertices, intersected) SparseTensors on `device`.
+    items: list of (coords, attr_dict) tuples; list index -> batch_idx.
+    Returns (coords_cpu, vfeats_cpu, ifeats_cpu, batch_size). The three
+    tensors are pinned so a later `.to(device, non_blocking=True)` can use
+    the copy engine and overlap with whatever's on the compute stream.
     """
-    vert_feats = []
-    inter_feats = []
-    bcoords_list = []
+    bcoords, vfeats, ifeats = [], [], []
     for b, (coords, attr) in enumerate(items):
         n = coords.shape[0]
         batch_col = torch.full((n, 1), b, dtype=coords.dtype)
-        bcoords_list.append(torch.cat([batch_col, coords], dim=-1))
-        vert_feats.append((attr['vertices'] / 255.0).float())
+        bcoords.append(torch.cat([batch_col, coords], dim=-1))
+        vfeats.append((attr['vertices'] / 255.0).float())
         ic = attr['intersected']
-        inter_feats.append(torch.cat([ic % 2, ic // 2 % 2, ic // 4 % 2], dim=-1).bool())
+        ifeats.append(torch.cat([ic % 2, ic // 2 % 2, ic // 4 % 2], dim=-1).bool())
+    c = torch.cat(bcoords, dim=0)
+    v = torch.cat(vfeats, dim=0)
+    i = torch.cat(ifeats, dim=0)
+    if pin_memory:
+        try:
+            c = c.pin_memory(); v = v.pin_memory(); i = i.pin_memory()
+        except RuntimeError:
+            # CUDA may complain if too much pinned -- silently fall back.
+            pass
+    return c, v, i, len(items)
 
-    coords_cat = torch.cat(bcoords_list, dim=0)
-    vertices = sp.SparseTensor(
-        torch.cat(vert_feats, dim=0),
-        coords_cat,
-    )
-    intersected = vertices.replace(torch.cat(inter_feats, dim=0))
-    return vertices.to(device), intersected.to(device)
+
+def _chunk_cpu_to_sparse(chunk_cpu, device):
+    """Move a CPU chunk to GPU and wrap in SparseTensor pair.
+
+    Uses non_blocking so the H2D copy can overlap with any work already
+    queued on the compute stream.
+    """
+    coords_cpu, vfeats_cpu, ifeats_cpu, _ = chunk_cpu
+    cg = coords_cpu.to(device, non_blocking=True)
+    vg = vfeats_cpu.to(device, non_blocking=True)
+    ig = ifeats_cpu.to(device, non_blocking=True)
+    vertices = sp.SparseTensor(vg, cg)
+    intersected = vertices.replace(ig)
+    return vertices, intersected
 
 
-def _encode_shape_chunk(encoder, items, device):
-    """Encode a chunk of frames in one forward. Returns list of (feats_np, coords_np)
-    aligned with `items`."""
-    if len(items) == 1:
-        # path-of-least-resistance for fallback
-        vertices, intersected = _build_sparse_chunk(items, device)
-    else:
-        vertices, intersected = _build_sparse_chunk(items, device)
+def _encode_shape_chunk_cpu(encoder, chunk_cpu, device):
+    """Run shape encoder for one pre-built CPU chunk. Returns
+    list[(feats_np, coords_np)] of length batch_size."""
+    batch_size = chunk_cpu[3]
+    vertices, intersected = _chunk_cpu_to_sparse(chunk_cpu, device)
     try:
         z = encoder(vertices, intersected)
         torch.cuda.synchronize()
         if not torch.isfinite(z.feats).all():
             raise ValueError("Non-finite values in shape latent")
         feats_all = z.feats.detach().cpu().numpy().astype(np.float32)
-        coords_all = z.coords.detach().cpu().numpy()  # uint? long; col0 = batch
+        coords_all = z.coords.detach().cpu().numpy()
     finally:
         del vertices, intersected
     out = []
     batch_col = coords_all[:, 0]
-    for b in range(len(items)):
+    for b in range(batch_size):
         mask = batch_col == b
-        feats = feats_all[mask]
-        coords = coords_all[mask, 1:].astype(np.uint8)
-        out.append((feats, coords))
+        out.append((feats_all[mask], coords_all[mask, 1:].astype(np.uint8)))
     return out
+
+
+# Back-compat shim: old code path (e.g. micro-benchmarks) used
+# `_encode_shape_chunk(encoder, list_of_items, device)`. Build the CPU chunk
+# on the spot and forward. Kept as a thin wrapper, no longer used in the
+# main loop.
+def _encode_shape_chunk(encoder, items, device):
+    cc = _build_chunk_cpu(items, pin_memory=False)
+    return _encode_shape_chunk_cpu(encoder, cc, device)
 
 
 def _encode_ss(encoder, coords_enc, ss_resolution: int, device: str):
@@ -173,7 +194,15 @@ def prepare_view(
     s3_input_root: str,
     resolution: int,
     tmp_root: str,
+    frame_chunk_size: int = 8,
+    pin_memory: bool = True,
 ) -> dict:
+    """Worker-thread stage 1.
+
+    Pull tar -> extract -> read every .vxz -> pre-build the CPU-side chunked
+    SparseTensor inputs (cat + pin_memory). Returns chunks ready for an
+    almost-free `_chunk_cpu_to_sparse(..., device)` on the main thread.
+    """
     view_key = f"{sha256}/view_{view_idx:02d}"
     tar_uri = f"{s3_input_root.rstrip('/')}/{resolution}/{sha256}/view_{view_idx:02d}.tar"
 
@@ -190,10 +219,13 @@ def prepare_view(
         "work_dir": work_dir,
         "status": "prepared",
         "frame_ids": [],
-        "loaded": [],
+        "loaded": [],          # kept around for the per-frame fallback path
+        "cpu_chunks": [],      # list of (coords_cpu, vfeats_cpu, ifeats_cpu, batch_size)
+        "chunk_fids": [],      # list[list[str]], aligned with cpu_chunks
         "t_get": 0.0,
         "t_extract": 0.0,
         "t_read": 0.0,
+        "t_build_cpu": 0.0,
         "error": None,
     }
     try:
@@ -217,8 +249,25 @@ def prepare_view(
         t0 = time.time()
         loaded = [_read_vxz_cpu(os.path.join(work_dir, n)) for n in vxz_files]
         out["t_read"] = round(time.time() - t0, 2)
-        out["frame_ids"] = [os.path.splitext(n)[0] for n in vxz_files]
+        fids = [os.path.splitext(n)[0] for n in vxz_files]
+        out["frame_ids"] = fids
         out["loaded"] = loaded
+
+        # CPU-side chunking + pin_memory. This is the ~1s/view torch.cat work
+        # we want to keep off the GPU main thread.
+        t0 = time.time()
+        cs = max(1, int(frame_chunk_size))
+        chunks_cpu = []
+        chunks_fids = []
+        i = 0
+        while i < len(loaded):
+            items = loaded[i:i + cs]
+            chunks_cpu.append(_build_chunk_cpu(items, pin_memory=pin_memory))
+            chunks_fids.append(fids[i:i + cs])
+            i += cs
+        out["cpu_chunks"] = chunks_cpu
+        out["chunk_fids"] = chunks_fids
+        out["t_build_cpu"] = round(time.time() - t0, 2)
         return out
     except Exception as e:
         out["status"] = "prepare_error"
@@ -240,36 +289,40 @@ def gpu_encode_view(
 ) -> tuple:
     """Run shape (+ optional SS) encoding for one prepared view.
 
+    Consumes the per-chunk CPU tensors prepare_view already built; main
+    thread only does H2D (overlapped) + forward + D2H.
     Returns (all_data, n_frames_encoded, t_encode_s, last_failed_frame_id).
     Raises on encode failure (caller maps to encode_error)."""
-    loaded = prepared["loaded"]
+    loaded = prepared["loaded"]                  # only used in per-frame fallback
     frame_ids = prepared["frame_ids"]
+    cpu_chunks = prepared["cpu_chunks"]
+    chunk_fids = prepared["chunk_fids"]
     all_data = {"num_frames": np.int32(len(loaded))}
     encoded = 0
     last_failed = None
 
-    cs = max(1, int(frame_chunk_size))
     t0 = time.time()
-    i = 0
-    while i < len(loaded):
-        chunk_items = loaded[i:i + cs]
-        chunk_fids = frame_ids[i:i + cs]
+    for chunk_cpu, fids in zip(cpu_chunks, chunk_fids):
         try:
-            outs = _encode_shape_chunk(shape_encoder, chunk_items, device)
+            outs = _encode_shape_chunk_cpu(shape_encoder, chunk_cpu, device)
         except Exception as e_chunk:
-            if len(chunk_items) == 1:
-                last_failed = chunk_fids[0]
-                raise RuntimeError(f"frame {chunk_fids[0]}: {e_chunk}") from e_chunk
+            if len(fids) == 1:
+                last_failed = fids[0]
+                raise RuntimeError(f"frame {fids[0]}: {e_chunk}") from e_chunk
             torch.cuda.empty_cache()
+            # Per-frame fallback: rebuild from `loaded` since pinned CPU chunk is
+            # already gone after a failed forward.
             outs = []
-            for k, item in enumerate(chunk_items):
+            base_idx = frame_ids.index(fids[0])
+            for k in range(len(fids)):
                 try:
-                    outs.append(_encode_shape_chunk(shape_encoder, [item], device)[0])
+                    cc = _build_chunk_cpu([loaded[base_idx + k]], pin_memory=False)
+                    outs.append(_encode_shape_chunk_cpu(shape_encoder, cc, device)[0])
                 except Exception as e_single:
-                    last_failed = chunk_fids[k]
+                    last_failed = fids[k]
                     raise RuntimeError(
-                        f"frame {chunk_fids[k]} (chunk fallback): {e_single}") from e_single
-        for fid, (feats, coords_enc) in zip(chunk_fids, outs):
+                        f"frame {fids[k]} (chunk fallback): {e_single}") from e_single
+        for fid, (feats, coords_enc) in zip(fids, outs):
             all_data[f"shape_feats_{fid}"] = feats
             all_data[f"shape_coords_{fid}"] = coords_enc
             if do_ss:
@@ -281,7 +334,6 @@ def gpu_encode_view(
                 all_data[f"ss_z_{fid}"] = ss_z
             encoded += 1
         torch.cuda.empty_cache()
-        i += cs
     t_encode = round(time.time() - t0, 2)
     return all_data, encoded, t_encode, last_failed
 
@@ -370,10 +422,14 @@ def main():
                         help="Number of frames batched into one shape-encoder forward. "
                              "On chunk failure the worker falls back to per-frame for "
                              "just that chunk so a single bad frame can't poison the view.")
-    parser.add_argument("--prefetch", type=int, default=4,
+    parser.add_argument("--prefetch", type=int, default=2,
                         help="Number of views to keep prepared in background threads. "
-                             "Higher values overlap S3/decode/CPU with GPU but use more "
-                             "/local-ssd space (each prepared view ~ tar + decoded vxz).")
+                             "Higher values overlap S3/decode/CPU+pinned-mem with GPU but "
+                             "use more /local-ssd space and pinned host memory "
+                             "(~2GB pinned per prepared view).")
+    parser.add_argument("--no_pin_memory", action="store_true",
+                        help="Disable pin_memory in the prefetch worker (use only if "
+                             "host RAM is tight; H2D will then be pageable+blocking).")
     args = parser.parse_args()
 
     if not _is_s3_uri(args.s3_input_root):
@@ -474,6 +530,7 @@ def main():
             fut = prep_pool.submit(
                 prepare_view, sha, vid,
                 args.s3_input_root, args.resolution, args.tmp_dir,
+                args.frame_chunk_size, not args.no_pin_memory,
             )
             prep_queue.append((cursor, sha, vid, fut, time.time()))
             cursor += 1
@@ -523,7 +580,8 @@ def main():
                     print(f"[timing] {sha[:12]}/view_{vid:02d} frames={entry.get('num_frames','?')} "
                           f"npz_mb={entry.get('npz_mb','?')} "
                           f"t_get={entry.get('t_get','?')}s t_extract={entry.get('t_extract','?')}s "
-                          f"t_read={entry.get('t_read','?')}s t_encode={entry.get('t_encode','?')}s "
+                          f"t_read={entry.get('t_read','?')}s t_build={entry.get('t_build_cpu','?')}s "
+                          f"t_encode={entry.get('t_encode','?')}s "
                           f"t_save={entry.get('t_save_npz','?')}s t_upload={entry.get('t_upload_npz','?')}s")
                     finalize_result(sha, vid, entry, t_view_start)
                     processed += 1
@@ -553,7 +611,9 @@ def main():
                                      extra_tb=prepared["error"])
                 entry = _entry(st, view_key=prepared["view_key"], num_frames=0,
                                t_get=prepared["t_get"], t_extract=prepared["t_extract"],
-                               t_read=prepared.get("t_read", 0.0), t_wait_prep=t_wait)
+                               t_read=prepared.get("t_read", 0.0),
+                               t_build_cpu=prepared.get("t_build_cpu", 0.0),
+                               t_wait_prep=t_wait)
                 shutil.rmtree(prepared["work_dir"], ignore_errors=True)
                 finalize_result(sha, vid, entry, t_view_start)
                 processed += 1
@@ -575,7 +635,9 @@ def main():
                 entry = _entry("encode_error", view_key=prepared["view_key"],
                                error=str(e)[:500],
                                t_get=prepared["t_get"], t_extract=prepared["t_extract"],
-                               t_read=prepared["t_read"], t_wait_prep=t_wait)
+                               t_read=prepared["t_read"],
+                               t_build_cpu=prepared.get("t_build_cpu", 0.0),
+                               t_wait_prep=t_wait)
                 finalize_result(sha, vid, entry, t_view_start)
                 processed += 1
                 continue
@@ -583,7 +645,9 @@ def main():
             # Hand off save+upload to background.
             entry = _entry("uploading", view_key=prepared["view_key"], num_frames=encoded,
                            t_get=prepared["t_get"], t_extract=prepared["t_extract"],
-                           t_read=prepared["t_read"], t_encode=t_encode, t_wait_prep=t_wait,
+                           t_read=prepared["t_read"],
+                           t_build_cpu=prepared.get("t_build_cpu", 0.0),
+                           t_encode=t_encode, t_wait_prep=t_wait,
                            failed_frame=last_failed)
             save_fut = save_pool.submit(
                 save_and_upload,

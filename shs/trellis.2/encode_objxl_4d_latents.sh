@@ -31,7 +31,7 @@ S3_OUTPUT="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/ob
 RESOLUTION="${RESOLUTION:-512}"
 SS_RESOLUTION="${SS_RESOLUTION:-32}"
 FRAME_CHUNK_SIZE="${FRAME_CHUNK_SIZE:-8}"
-PREFETCH="${PREFETCH:-4}"
+PREFETCH="${PREFETCH:-2}"
 MAX_ITEMS_ARG=()
 if [[ -n "${MAX_ITEMS:-}" ]]; then
     MAX_ITEMS_ARG=(--max_items "$MAX_ITEMS")
