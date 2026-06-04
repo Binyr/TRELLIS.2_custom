@@ -19,7 +19,7 @@ if [[ -f /etc/profile.d/koala_env.sh ]]; then
     source /etc/profile.d/koala_env.sh
 fi
 
-export HF_HOME=${HF_HOME:-/local-ssd/hf_cache}
+export HF_HOME=/local-ssd/hf_cache
 
 VOXEL_LOGS_PREFIX="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/objxl/dynamic_obj_voxel_32f/logs/"
 S3_INPUT="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/objxl/dynamic_obj_voxel_32f"
