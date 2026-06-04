@@ -259,6 +259,84 @@ def load_finished_views(path_or_uri: str, local_cache_path: str) -> list:
     return out
 
 
+def summarize_finished_views_from_logs(logs_prefix: str, local_cache_dir: str) -> list:
+    """Dynamically scan progress_*.json under logs_prefix and return the same
+    list shape as load_finished_views (list of (sha, view_idx) tuples).
+
+    Mirrors `tools/voxel/build_render_finished_views.py` but inlined so the
+    voxel worker can re-summarize at startup without depending on a stale
+    pre-built finished_views.json sitting on S3."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not logs_prefix.endswith("/"):
+        logs_prefix = logs_prefix + "/"
+    os.makedirs(local_cache_dir, exist_ok=True)
+
+    # List progress_*.json under the prefix.
+    proc = run_aws(["s3", "ls", logs_prefix], retries=2)
+    if proc.returncode != 0:
+        raise RuntimeError(f"aws s3 ls failed for {logs_prefix}: {proc.stderr.strip()[:300]}")
+    uris = []
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name = parts[-1]
+        if name.startswith("progress_") and name.endswith(".json"):
+            uris.append(logs_prefix + name)
+    uris.sort()
+    print(f"[manifest:dyn] found {len(uris)} progress_*.json under {logs_prefix}")
+    if not uris:
+        raise RuntimeError(f"No progress_*.json under {logs_prefix}")
+
+    def _dl(uri):
+        local = os.path.join(local_cache_dir, uri.rsplit("/", 1)[-1])
+        ok = s3_get_file(uri, local, retries=2)
+        return uri, local, ok
+
+    success_keys = set()
+    status_counter = {}
+    failed_dl = 0
+    failed_parse = 0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for fut in as_completed([ex.submit(_dl, u) for u in uris]):
+            uri, local, ok = fut.result()
+            if not ok:
+                failed_dl += 1
+                continue
+            try:
+                with open(local) as f:
+                    d = json.load(f)
+            except Exception:
+                failed_parse += 1
+                continue
+            if not isinstance(d, dict):
+                failed_parse += 1
+                continue
+            for view_key, entry in d.items():
+                st = (entry or {}).get("status", "unknown") if isinstance(entry, dict) else "unknown"
+                status_counter[st] = status_counter.get(st, 0) + 1
+                if st == "success":
+                    success_keys.add(view_key)
+
+    print(f"[manifest:dyn] download ok={len(uris)-failed_dl} failed={failed_dl} "
+          f"parse_failed={failed_parse}")
+    print(f"[manifest:dyn] aggregate status counts (NOT deduped across ranks): {status_counter}")
+    print(f"[manifest:dyn] unique success views: {len(success_keys)}")
+
+    out, bad = [], 0
+    for key in success_keys:
+        try:
+            sha, view = key.split("/")
+            assert view.startswith("view_")
+            out.append((sha, int(view[len("view_"):])))
+        except Exception:
+            bad += 1
+    if bad:
+        print(f"[manifest:dyn] {bad} malformed keys skipped")
+    return out
+
+
 # =====================================================================================
 # Core: voxelize one (sha256, view_idx) -> view_XX.tar per resolution
 # =====================================================================================
@@ -460,8 +538,14 @@ def voxelize_one_view(sha256: str, view_idx: int, s3_input_root: str,
 def main():
     sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--finished_views", type=str, required=True,
-                        help="JSON list of 'sha/view_XX' strings (S3 URI or local path)")
+    parser.add_argument("--finished_views", type=str, default="",
+                        help="JSON list of 'sha/view_XX' strings (S3 URI or local path). "
+                             "Mutually exclusive with --render_logs_prefix.")
+    parser.add_argument("--render_logs_prefix", type=str, default="",
+                        help="S3 prefix containing progress_*.json from the render stage "
+                             "(e.g. s3://.../rendered_v1/logs/). When set, the worker "
+                             "summarizes finished views from these files at startup "
+                             "instead of reading a pre-built JSON.")
     parser.add_argument("--s3_input_root", type=str, required=True,
                         help="S3 prefix containing <sha256>/view_XX/{mesh.npz,result.json}")
     parser.add_argument("--s3_output_root", type=str, required=True,
@@ -498,8 +582,15 @@ def main():
     print(f"[main] rank={args.rank}/{args.world_size} state={args.state_dir} tmp={args.tmp_dir}")
 
     # L1: load global finished views.
-    cache_path = os.path.join(args.state_dir, "finished_views.json")
-    all_tasks = load_finished_views(args.finished_views, cache_path)
+    if bool(args.finished_views) == bool(args.render_logs_prefix):
+        raise SystemExit("[main] must supply exactly one of --finished_views or "
+                         "--render_logs_prefix")
+    if args.render_logs_prefix:
+        cache_dir = os.path.join(args.state_dir, "render_progress_cache")
+        all_tasks = summarize_finished_views_from_logs(args.render_logs_prefix, cache_dir)
+    else:
+        cache_path = os.path.join(args.state_dir, "finished_views.json")
+        all_tasks = load_finished_views(args.finished_views, cache_path)
     all_tasks.sort()
     print(f"[main] global finished views: {len(all_tasks)}")
 
