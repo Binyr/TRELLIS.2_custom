@@ -39,7 +39,13 @@ ARCHIVE_BLEND_EXT = ".blend"
 
 
 VIEW_DONE_PREFIX = "[VIEW_DONE] "
-TERMINAL_SKIP_STATUSES = {"success", "missing_resource"}
+# View statuses we will RETRY on resume. Anything not in this set (and not
+# the empty string, which means "never attempted") is treated as terminal
+# and skipped on the next run — including `success`, `missing_resource`,
+# `timeout`, `blender_failed`, `extract_failed`, `missing_input`, etc.
+# `upload_failed` is the only retryable failure: the render itself worked,
+# only the S3 cp failed, so a retry is cheap and likely to succeed.
+RETRY_STATUSES = {"upload_failed"}
 
 
 # =====================================================================================
@@ -148,7 +154,13 @@ class ProgressStore:
         return self.view_status(sha256, view_idx) == "success"
 
     def is_view_terminal(self, sha256: str, view_idx: int) -> bool:
-        return self.view_status(sha256, view_idx) in TERMINAL_SKIP_STATUSES
+        # Terminal = "do not re-render on resume". A view is terminal whenever
+        # we have ANY recorded status for it that is not in RETRY_STATUSES.
+        # Empty status (never attempted) is NOT terminal.
+        st = self.view_status(sha256, view_idx)
+        if not st:
+            return False
+        return st not in RETRY_STATUSES
 
     def pending_views(self, sha256: str, all_view_indices) -> list:
         return [v for v in all_view_indices if not self.is_view_terminal(sha256, v)]

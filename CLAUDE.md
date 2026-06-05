@@ -17,9 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 你的远程目录为`/local-ssd/TRELLIS.2/`
 
-远程的环境，通过在远程仓库目录下，`source .venv/bin/activate`激活
-
-远程里只有outputs目录是永存目录，其他目录都是临时目录，运行结果请尽可能保存在outputs里
+远程的环境，通过在远程仓库目录下，`source /local-ssd/trellis.2-venv/bin/activate`激活
 
 data里的东西不允许修改
 
@@ -39,6 +37,8 @@ koala 只能在跳板机使用
 查看运行中的任务: koala list
 查看失败的任务: koala list -s failed
 删除任务：koala delete -y 任务名
+
+请不要擅自修改我给你的指令，有错可以报告 
 
 ## Project Overview
 
