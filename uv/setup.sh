@@ -11,6 +11,37 @@ else
 fi
 echo "[UV_CACHE] Using cache: $UV_CACHE_DIR"
 
+YANRUIBIN_S3_ROOT="s3://arcwm-code-us-west-2/yanruibin"
+YANRUIBIN_MOUNT_ROOT="/threed-code/yanruibin"
+LOCAL_SSD_ROOT="/local-ssd"
+
+localize_yanruibin_s3_path() {
+    local mounted_path="$1"
+    case "$mounted_path" in
+        "$YANRUIBIN_MOUNT_ROOT"/*) ;;
+        *)
+            echo "[S3_LOCALIZE] unsupported path: $mounted_path" >&2
+            return 2
+            ;;
+    esac
+
+    local rel_path="${mounted_path#$YANRUIBIN_MOUNT_ROOT/}"
+    local s3_path="$YANRUIBIN_S3_ROOT/$rel_path"
+    local local_path="$LOCAL_SSD_ROOT/$rel_path"
+    mkdir -p "$(dirname "$local_path")"
+    echo "[S3_LOCALIZE] $s3_path -> $local_path" >&2
+    aws s3 cp --only-show-errors "$s3_path" "$local_path"
+    printf '%s\n' "$local_path"
+}
+
+uv_pip_install_yanruibin_s3() {
+    local mounted_path="$1"
+    shift
+    local local_path
+    local_path="$(localize_yanruibin_s3_path "$mounted_path")" || return
+    uv pip install "$local_path" "$@"
+}
+
 # Read Arguments
 TEMP=`getopt -o h --long help,new-env,basic,train,xformers,flash-attn,diffoctreerast,vox2seq,spconv,mipgaussian,kaolin,nvdiffrast,demo,cuda:,venv-dir: -n 'setup_uv.sh' -- "$@"`
 
@@ -183,7 +214,7 @@ apt install -y p7zip-full unrar
 # cd third_party/torchsparse
 # uv pip install . --no-build-isolation
 # cd $x
-uv pip install /threed-code/yanruibin/efs/packages/torchsparse-2.1.0-cp312-cp312-linux_x86_64.whl
+uv_pip_install_yanruibin_s3 /threed-code/yanruibin/efs/packages/torchsparse-2.1.0-cp312-cp312-linux_x86_64.whl
 
 echo "[INSTALL] requirements_v2.txt..."
 apt install -y python3.12-dev # Triton 在初始化时需要编译一个小的 C 文件，要用到 Python 头文件，但系统没装 Python dev 包
@@ -197,8 +228,8 @@ echo "[INSTALL] direct3ds2_train (editable)..."
 uv pip install pytorch_lightning
 uv pip install wandb
 uv pip install lightning
-uv pip install /threed-code/yanruibin/efs/packages/natten-0.21.1+torch280cu128-cp312-cp312-linux_x86_64.whl
-uv pip install /threed-code/yanruibin/efs/packages/utils3d-1.7-py3-none-any.whl
+uv_pip_install_yanruibin_s3 /threed-code/yanruibin/efs/packages/natten-0.21.1+torch280cu128-cp312-cp312-linux_x86_64.whl
+uv_pip_install_yanruibin_s3 /threed-code/yanruibin/efs/packages/utils3d-1.7-py3-none-any.whl
 uv pip install tensorboard
 uv pip install flash-attn-4==4.0.0b8
 
@@ -294,13 +325,13 @@ fi
 
 # nvdiffrast (pre-built wheel, required by o_voxel)
 echo "[INSTALL] nvdiffrast..."
-uv pip install /threed-code/yanruibin/efs/packages/nvdiffrast-0.4.0-cp312-cp312-linux_x86_64.whl
+uv_pip_install_yanruibin_s3 /threed-code/yanruibin/efs/packages/nvdiffrast-0.4.0-cp312-cp312-linux_x86_64.whl
 
 # o-voxel and its compiled dependencies (pre-built wheels to avoid high memory usage)
 echo "[INSTALL] cumesh, flex_gemm, o-voxel (pre-built wheels)..."
-uv pip install /threed-code/yanruibin/efs/packages/cumesh-0.0.1-cp312-cp312-linux_x86_64.whl
-uv pip install /threed-code/yanruibin/efs/packages/flex_gemm-1.0.0-cp312-cp312-linux_x86_64.whl
-uv pip install /threed-code/yanruibin/efs/packages/o_voxel-0.0.1-cp312-cp312-linux_x86_64.whl --no-deps
+uv_pip_install_yanruibin_s3 /threed-code/yanruibin/efs/packages/cumesh-0.0.1-cp312-cp312-linux_x86_64.whl
+uv_pip_install_yanruibin_s3 /threed-code/yanruibin/efs/packages/flex_gemm-1.0.0-cp312-cp312-linux_x86_64.whl
+uv_pip_install_yanruibin_s3 /threed-code/yanruibin/efs/packages/o_voxel-0.0.1-cp312-cp312-linux_x86_64.whl --no-deps
 uv pip install plyfile zstandard
 uv pip install natsort
 
