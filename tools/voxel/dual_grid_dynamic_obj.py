@@ -4,7 +4,7 @@ Voxelize dynamic_obj renders into per-view dual-grid `.vxz` tars.
 
 For every `<sha256>/view_XX` entry listed in `render_finished_view.json`:
 
-  1. Download `mesh.npz` + `result.json` from S3 to `/local-ssd` scratch.
+  1. Download `mesh.npz` + `result.json` from S3 to `/tmp` scratch.
   2. Convert every frame to a dual-grid voxel via
      `o_voxel.convert.mesh_to_flexible_dual_grid` (mirrors `dual_grid_v2.py`).
   3. Pack all frame `.vxz` files of a single view into one `view_XX.tar`.
@@ -584,8 +584,8 @@ def main():
                         help="S3 prefix to upload {res}/<sha256>/view_XX.tar under")
     parser.add_argument("--resolution", type=str, default="512",
                         help="Comma-separated resolutions (e.g. 256,512)")
-    parser.add_argument("--state_dir", type=str, default="/local-ssd/dual_grid_state")
-    parser.add_argument("--tmp_dir", type=str, default="/local-ssd/tmp_dual_grid")
+    parser.add_argument("--state_dir", type=str, default="/tmp/dual_grid_state")
+    parser.add_argument("--tmp_dir", type=str, default="/tmp/tmp_dual_grid")
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world_size", type=int, default=1)
     parser.add_argument("--max_face_count", type=int, default=500_000)

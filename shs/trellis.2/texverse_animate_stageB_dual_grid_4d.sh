@@ -39,7 +39,7 @@ WS=${1:-1}
 RANK=${2:-0}
 
 # --- Full stdout: tee to local file + periodic upload to S3 ---
-LOCAL_STDOUT_DIR=/local-ssd/texverse_B_dual_grid_stdouts
+LOCAL_STDOUT_DIR=/tmp/texverse_B_dual_grid_stdouts
 LOCAL_LOG="$LOCAL_STDOUT_DIR/rank_${RANK}.log"
 S3_STDOUT_LOG="$S3_OUTPUT/_logs/std_outs/rank_${RANK}.log"
 STDOUT_SYNC_INTERVAL="${STDOUT_SYNC_INTERVAL:-60}"
@@ -100,7 +100,7 @@ python -u tools/voxel/dual_grid_dynamic_obj.py \
     --resolution "$RESOLUTION" \
     --max_frames "$MAX_FRAMES" \
     --frame_sampling "$FRAME_SAMPLING" \
-    --state_dir /local-ssd/texverse_B_dual_grid_state \
-    --tmp_dir   /local-ssd/texverse_B_tmp_dual_grid \
+    --state_dir /tmp/texverse_B_dual_grid_state \
+    --tmp_dir   /tmp/texverse_B_tmp_dual_grid \
     --world_size "$WS" --rank "$RANK" \
     "${MAX_ITEMS_ARG[@]}"
