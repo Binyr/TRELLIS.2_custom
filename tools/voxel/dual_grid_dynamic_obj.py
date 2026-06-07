@@ -47,7 +47,11 @@ import torch
 import o_voxel
 
 
-TERMINAL_SKIP_STATUSES = {"success", "skipped_too_many_faces"}
+TERMINAL_SKIP_STATUSES = {
+    "success",
+    "skipped_too_many_faces",
+    "invalid_mesh_nonfinite",
+}
 
 
 def pick_frame_sel(num_frames: int, max_frames: int, mode: str) -> list:
@@ -413,6 +417,18 @@ def voxelize_one_view(sha256: str, view_idx: int, s3_input_root: str,
         timings["t_load_mesh"] = time.time() - t_lm
         num_frames_orig = int(vertices_seq.shape[0])
         num_faces = int(faces.shape[0])
+        nonfinite_vertices = int(vertices_seq.size - np.isfinite(vertices_seq).sum())
+        nonfinite_faces = int(faces.size - np.isfinite(faces).sum())
+        if nonfinite_vertices or nonfinite_faces:
+            return {
+                "status": "invalid_mesh_nonfinite",
+                "num_faces": num_faces,
+                "num_frames_orig": num_frames_orig,
+                "vertices_shape": list(vertices_seq.shape),
+                "faces_shape": list(faces.shape),
+                "nonfinite_vertices": nonfinite_vertices,
+                "nonfinite_faces": nonfinite_faces,
+            }
         if num_faces > max_face_count:
             return {"status": "skipped_too_many_faces",
                     "num_faces": num_faces, "num_frames_orig": num_frames_orig}
