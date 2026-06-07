@@ -22,6 +22,10 @@ S3_INPUT="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/obj
 S3_OUTPUT="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/objxl/dynamic_obj_voxel_32f"
 
 RESOLUTION="${RESOLUTION:-512}"
+LOG_SUFFIX=""
+if [[ "$RESOLUTION" != "512" ]]; then
+    LOG_SUFFIX="_${RESOLUTION//,/_}"
+fi
 MAX_FRAMES="${MAX_FRAMES:-32}"
 FRAME_SAMPLING="${FRAME_SAMPLING:-center}"
 MAX_ITEMS_ARG=()
@@ -33,9 +37,9 @@ WS=${1:-1}
 RANK=${2:-0}
 
 # --- Full stdout: tee to local file + periodic upload to S3 ---
-LOCAL_STDOUT_DIR=/local-ssd/objxl_dual_grid_stdouts
+LOCAL_STDOUT_DIR="/tmp/objxl_dual_grid_stdouts${LOG_SUFFIX}"
 LOCAL_LOG="$LOCAL_STDOUT_DIR/rank_${RANK}.log"
-S3_STDOUT_LOG="$S3_OUTPUT/_logs/std_outs/rank_${RANK}.log"
+S3_STDOUT_LOG="$S3_OUTPUT/_logs${LOG_SUFFIX}/std_outs/rank_${RANK}.log"
 STDOUT_SYNC_INTERVAL="${STDOUT_SYNC_INTERVAL:-60}"
 
 mkdir -p "$LOCAL_STDOUT_DIR"
@@ -94,7 +98,7 @@ python -u tools/voxel/dual_grid_dynamic_obj.py \
     --resolution "$RESOLUTION" \
     --max_frames "$MAX_FRAMES" \
     --frame_sampling "$FRAME_SAMPLING" \
-    --state_dir /local-ssd/dual_grid_state \
-    --tmp_dir   /local-ssd/tmp_dual_grid \
+    --state_dir /tmp/objxl_dual_grid_state \
+    --tmp_dir   /tmp/objxl_tmp_dual_grid \
     --world_size "$WS" --rank "$RANK" \
     "${MAX_ITEMS_ARG[@]}"

@@ -28,6 +28,10 @@ S3_INPUT="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/tex
 S3_OUTPUT="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/texverse_1k_animate/texverse_B_voxel"
 
 RESOLUTION="${RESOLUTION:-512}"
+LOG_SUFFIX=""
+if [[ "$RESOLUTION" != "512" ]]; then
+    LOG_SUFFIX="_${RESOLUTION//,/_}"
+fi
 MAX_FRAMES="${MAX_FRAMES:-32}"
 FRAME_SAMPLING="${FRAME_SAMPLING:-center}"
 MAX_ITEMS_ARG=()
@@ -39,9 +43,9 @@ WS=${1:-1}
 RANK=${2:-0}
 
 # --- Full stdout: tee to local file + periodic upload to S3 ---
-LOCAL_STDOUT_DIR=/tmp/texverse_B_dual_grid_stdouts
+LOCAL_STDOUT_DIR="/tmp/texverse_B_dual_grid_stdouts${LOG_SUFFIX}"
 LOCAL_LOG="$LOCAL_STDOUT_DIR/rank_${RANK}.log"
-S3_STDOUT_LOG="$S3_OUTPUT/_logs/std_outs/rank_${RANK}.log"
+S3_STDOUT_LOG="$S3_OUTPUT/_logs${LOG_SUFFIX}/std_outs/rank_${RANK}.log"
 STDOUT_SYNC_INTERVAL="${STDOUT_SYNC_INTERVAL:-60}"
 
 mkdir -p "$LOCAL_STDOUT_DIR"

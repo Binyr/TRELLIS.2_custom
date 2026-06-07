@@ -103,9 +103,16 @@ def s3_cp_file(local_path: str, s3_uri: str, retries: int = 2) -> bool:
     return True
 
 
+def log_suffix_for_resolutions(resolutions: list[int]) -> str:
+    if resolutions == [512]:
+        return ""
+    return "_" + "_".join(str(x) for x in resolutions)
+
+
 def upload_error_log(s3_output_root: str, rank: int, sha256: str, view_idx: int,
-                     header: str, exc: BaseException = None, extra_tb: str = None) -> None:
-    """Upload a plaintext error log to {s3_output_root}/_logs/<rank>/<sha>_view_XX.txt."""
+                     header: str, log_suffix: str = "", exc: BaseException = None,
+                     extra_tb: str = None) -> None:
+    """Upload a plaintext error log to {s3_output_root}/_logs{suffix}/rank_<rank>/..."""
     try:
         body = [
             f"sha256: {sha256}",
@@ -122,7 +129,8 @@ def upload_error_log(s3_output_root: str, rank: int, sha256: str, view_idx: int,
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
             f.write("\n".join(body))
             tmp_path = f.name
-        s3_uri = f"{s3_output_root.rstrip('/')}/_logs/rank_{rank}/{sha256}_view_{view_idx:02d}.txt"
+        s3_uri = (f"{s3_output_root.rstrip('/')}/_logs{log_suffix}/rank_{rank}/"
+                  f"{sha256}_view_{view_idx:02d}.txt")
         s3_cp_file(tmp_path, s3_uri, retries=1)
         os.unlink(tmp_path)
     except Exception as e:
@@ -143,14 +151,17 @@ def s3_exists_file(s3_uri: str) -> bool:
 
 class ProgressStore:
     def __init__(self, s3_output_root: str, rank: int, local_state_dir: str,
-                 push_every_updates: int = 8, push_min_interval_s: float = 30.0):
+                 log_suffix: str = "", push_every_updates: int = 8,
+                 push_min_interval_s: float = 30.0):
         os.makedirs(local_state_dir, exist_ok=True)
         self.rank = int(rank)
-        self.s3_logs_root = s3_output_root.rstrip("/") + "/logs"
+        self.s3_logs_root = s3_output_root.rstrip("/") + f"/logs{log_suffix}"
         self.s3_progress_uri = f"{self.s3_logs_root}/voxel_progress_{rank}.json"
         self.s3_status_uri = f"{self.s3_logs_root}/voxel_status_{rank}.log"
-        self.local_progress = os.path.join(local_state_dir, f"voxel_progress_{rank}.json")
-        self.local_status = os.path.join(local_state_dir, f"voxel_status_{rank}.log")
+        self.local_progress = os.path.join(local_state_dir,
+                                           f"voxel_progress_{rank}{log_suffix}.json")
+        self.local_status = os.path.join(local_state_dir,
+                                         f"voxel_status_{rank}{log_suffix}.log")
         self.progress: dict = {}
         self.push_every_updates = max(1, int(push_every_updates))
         self.push_min_interval_s = float(push_min_interval_s)
@@ -604,7 +615,9 @@ def main():
         raise SystemExit("--s3_output_root must be s3://")
 
     resolutions = [int(x) for x in args.resolution.split(",")]
+    log_suffix = log_suffix_for_resolutions(resolutions)
     print(f"[main] resolutions={resolutions}")
+    print(f"[main] log_suffix={log_suffix or '<default>'}")
 
     # Per-rank scratch / state isolation.
     args.state_dir = os.path.join(args.state_dir, f"rank_{args.rank}")
@@ -633,7 +646,8 @@ def main():
     print(f"[main] rank {args.rank}: {len(my_tasks)} tasks (idx {start}:{end})")
 
     # L2: load per-rank progress.
-    progress = ProgressStore(args.s3_output_root, args.rank, args.state_dir)
+    progress = ProgressStore(args.s3_output_root, args.rank, args.state_dir,
+                             log_suffix=log_suffix)
     progress.load()
 
     to_process = [(s, v) for s, v in my_tasks if not progress.is_terminal(s, v)]
@@ -670,7 +684,8 @@ def main():
             result = {"status": "worker_error", "error": f"{type(e).__name__}: {e}"}
             print(f"[main] worker error {sha256}/view_{view_idx:02d}: {result['error']}")
             upload_error_log(args.s3_output_root, args.rank, sha256, view_idx,
-                             header=f"worker_error: {result['error']}", exc=e)
+                             header=f"worker_error: {result['error']}",
+                             log_suffix=log_suffix, exc=e)
 
         status = result.get("status", "unknown")
         if status == "success":
@@ -683,10 +698,12 @@ def main():
             tb = result.pop("traceback", None) if isinstance(result, dict) else None
             if tb:
                 upload_error_log(args.s3_output_root, args.rank, sha256, view_idx,
-                                 header=f"status={status}", extra_tb=tb)
+                                 header=f"status={status}", log_suffix=log_suffix,
+                                 extra_tb=tb)
             elif status not in ("worker_error",):  # worker_error already uploaded above
                 upload_error_log(args.s3_output_root, args.rank, sha256, view_idx,
                                  header=f"status={status} (no python traceback)",
+                                 log_suffix=log_suffix,
                                  extra_tb=json.dumps(result, indent=2, default=str))
 
         elapsed = time.time() - t0
