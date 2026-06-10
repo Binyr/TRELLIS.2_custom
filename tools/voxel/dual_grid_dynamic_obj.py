@@ -51,6 +51,10 @@ TERMINAL_SKIP_STATUSES = {
     "success",
     "skipped_too_many_faces",
     "invalid_mesh_nonfinite",
+    "missing_mesh",
+    "missing_camera",
+    "dual_grid_error",
+    "worker_error",
 }
 
 
