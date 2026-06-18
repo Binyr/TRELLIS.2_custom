@@ -24,11 +24,15 @@ fi
 
 export HF_HOME=/local-ssd/hf_cache
 
-VOXEL_LOGS_PREFIX="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/texverse_1k_animate/texverse_B_voxel/logs/"
 S3_INPUT="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/texverse_1k_animate/texverse_B_voxel"
 S3_OUTPUT="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/texverse_1k_animate/texverse_B_voxel_latent"
 
 RESOLUTION="${RESOLUTION:-512}"
+LOG_SUFFIX=""
+if [[ "$RESOLUTION" != "512" ]]; then
+    LOG_SUFFIX="_${RESOLUTION//,/_}"
+fi
+VOXEL_LOGS_PREFIX="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data/texverse_1k_animate/texverse_B_voxel/logs${LOG_SUFFIX}/"
 SS_RESOLUTION="${SS_RESOLUTION:-32}"
 FRAME_CHUNK_SIZE="${FRAME_CHUNK_SIZE:-8}"
 PREFETCH="${PREFETCH:-2}"
@@ -41,9 +45,9 @@ WS=${1:-1}
 RANK=${2:-0}
 
 # --- Full stdout: tee + periodic upload to S3 ---
-LOCAL_STDOUT_DIR=/local-ssd/encode_texverse_B_stdouts
+LOCAL_STDOUT_DIR="/local-ssd/encode_texverse_B_stdouts${LOG_SUFFIX}"
 LOCAL_LOG="$LOCAL_STDOUT_DIR/rank_${RANK}.log"
-S3_STDOUT_LOG="$S3_OUTPUT/_logs/std_outs/rank_${RANK}.log"
+S3_STDOUT_LOG="$S3_OUTPUT/_logs${LOG_SUFFIX}/std_outs/rank_${RANK}.log"
 STDOUT_SYNC_INTERVAL="${STDOUT_SYNC_INTERVAL:-60}"
 
 mkdir -p "$LOCAL_STDOUT_DIR"
@@ -101,6 +105,7 @@ python -u tools/encode_ovoxel_to_latents_objxl.py \
     --s3_input_root     "$S3_INPUT" \
     --s3_output_root    "$S3_OUTPUT" \
     --resolution        "$RESOLUTION" \
+    --log_suffix        "$LOG_SUFFIX" \
     --ss_resolution     "$SS_RESOLUTION" \
     --frame_chunk_size  "$FRAME_CHUNK_SIZE" \
     --prefetch          "$PREFETCH" \
