@@ -408,6 +408,9 @@ def main():
     parser.add_argument("--s3_output_root", type=str, required=True,
                         help="s3://.../dynamic_obj_voxel_32f_latent")
     parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--log_suffix", type=str, default="",
+                        help="Suffix for encode logs/progress, e.g. _1024. "
+                             "Default keeps the 512 layout under logs/ and _logs/.")
     parser.add_argument("--ss_resolution", type=int, default=32)
     parser.add_argument("--shape_enc_pretrained", type=str,
                         default="microsoft/TRELLIS.2-4B/ckpts/shape_enc_next_dc_f16c32_fp16")
@@ -457,7 +460,7 @@ def main():
     # This way, if world_size changes between launches (or a rank is
     # re-submitted), no rank re-encodes work another rank has already done.
     cross_cache = os.path.join(args.state_dir, "cross_rank_progress_cache")
-    encode_logs_prefix = f"{args.s3_output_root.rstrip('/')}/logs/"
+    encode_logs_prefix = f"{args.s3_output_root.rstrip('/')}/logs{args.log_suffix}/"
     cross_done = summarize_finished_views_from_logs(
         encode_logs_prefix, cross_cache,
         filename_prefix="encode_progress_",
@@ -479,14 +482,19 @@ def main():
 
     # L2: per-rank progress (for retried-transient handling and per-rank
     # bookkeeping; cross-rank skip already excluded global terminals).
-    progress = ProgressStore(args.s3_output_root, args.rank, args.state_dir)
+    progress = ProgressStore(args.s3_output_root, args.rank, args.state_dir,
+                             log_suffix=args.log_suffix)
     # rename the per-rank progress URIs so they don't collide with voxel-stage files.
     progress.s3_progress_uri = (
-        f"{args.s3_output_root.rstrip('/')}/logs/encode_progress_{args.rank}.json")
+        f"{args.s3_output_root.rstrip('/')}/logs{args.log_suffix}/"
+        f"encode_progress_{args.rank}.json")
     progress.s3_status_uri = (
-        f"{args.s3_output_root.rstrip('/')}/logs/encode_status_{args.rank}.log")
-    progress.local_progress = os.path.join(args.state_dir, f"encode_progress_{args.rank}.json")
-    progress.local_status = os.path.join(args.state_dir, f"encode_status_{args.rank}.log")
+        f"{args.s3_output_root.rstrip('/')}/logs{args.log_suffix}/"
+        f"encode_status_{args.rank}.log")
+    progress.local_progress = os.path.join(
+        args.state_dir, f"encode_progress_{args.rank}{args.log_suffix}.json")
+    progress.local_status = os.path.join(
+        args.state_dir, f"encode_status_{args.rank}{args.log_suffix}.log")
     progress.load()
 
     def _done(sha, vid):
@@ -571,6 +579,7 @@ def main():
             if st != "encode_error":
                 upload_error_log(args.s3_output_root, args.rank, sha, vid,
                                  header=f"soft_failure:{st}",
+                                 log_suffix=args.log_suffix,
                                  extra_tb=json.dumps(result, default=str, indent=2))
 
         rate = (n_ok + n_fail) / max(1e-6, time.time() - t_start)
@@ -629,6 +638,7 @@ def main():
                 if st == "prepare_error" and prepared.get("error"):
                     upload_error_log(args.s3_output_root, args.rank, sha, vid,
                                      header="prepare_error",
+                                     log_suffix=args.log_suffix,
                                      extra_tb=prepared["error"])
                 entry = _entry(st, view_key=prepared["view_key"], num_frames=0,
                                t_get=prepared["t_get"], t_extract=prepared["t_extract"],
@@ -651,7 +661,7 @@ def main():
                 tb = traceback.format_exc()
                 print(f"[error] {sha}/view_{vid:02d}: {e}\n{tb}")
                 upload_error_log(args.s3_output_root, args.rank, sha, vid,
-                                 header=str(e), exc=e)
+                                 header=str(e), log_suffix=args.log_suffix, exc=e)
                 shutil.rmtree(prepared["work_dir"], ignore_errors=True)
                 entry = _entry("encode_error", view_key=prepared["view_key"],
                                error=str(e)[:500],
