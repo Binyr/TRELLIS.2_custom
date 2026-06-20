@@ -396,6 +396,106 @@ TERMINAL_SKIP_STATUSES = {"success", "no_vxz", "encode_error"}
 TRANSIENT_STATUSES = {"missing_tar", "upload_failed", "prepare_error"}
 
 
+def _task_key(task):
+    sha, vid = task
+    return f"{sha}/view_{int(vid):02d}"
+
+
+def _parse_view_key(view_key: str):
+    sha, view = view_key.split("/")
+    if not view.startswith("view_"):
+        raise ValueError(view_key)
+    return sha, int(view[len("view_"):])
+
+
+def load_progress_snapshot(path_or_uri: str, local_cache_path: str,
+                           statuses=TERMINAL_SKIP_STATUSES) -> set:
+    """Load a frozen global progress snapshot.
+
+    Accepted JSON shapes:
+      * ["sha/view_00", ...]
+      * {"sha/view_00": {"status": "success", ...}, ...}
+      * {"views": ["sha/view_00", ...]}
+      * {"views": {"sha/view_00": {"status": "success", ...}, ...}}
+    """
+    if _is_s3_uri(path_or_uri):
+        if not s3_get_file(path_or_uri, local_cache_path, retries=3):
+            raise RuntimeError(f"failed to download snapshot {path_or_uri}")
+        local_path = local_cache_path
+    else:
+        local_path = path_or_uri
+
+    with open(local_path) as f:
+        raw = json.load(f)
+    if isinstance(raw, dict) and "views" in raw:
+        raw = raw["views"]
+
+    status_set = set(statuses)
+    keys = set()
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                keys.add(item)
+            elif isinstance(item, dict):
+                key = item.get("view_key")
+                st = item.get("status")
+                if key and (st is None or st in status_set):
+                    keys.add(key)
+    elif isinstance(raw, dict):
+        for key, entry in raw.items():
+            st = (entry or {}).get("status", "unknown") if isinstance(entry, dict) else "unknown"
+            if st in status_set:
+                keys.add(key)
+    else:
+        raise RuntimeError(
+            f"expected snapshot list/dict in {path_or_uri}, got {type(raw).__name__}")
+
+    out = set()
+    bad = 0
+    for key in keys:
+        try:
+            out.add(_parse_view_key(key))
+        except Exception:
+            bad += 1
+    if bad:
+        print(f"[snapshot] {bad} malformed keys skipped")
+    print(f"[snapshot] loaded {len(out)} terminal views from {path_or_uri}")
+    return out
+
+
+def write_progress_snapshot(encode_logs_prefix: str, output_path_or_uri: str,
+                            local_cache_dir: str,
+                            statuses=TERMINAL_SKIP_STATUSES) -> None:
+    terminal = summarize_finished_views_from_logs(
+        encode_logs_prefix, local_cache_dir,
+        filename_prefix="encode_progress_",
+        statuses=tuple(statuses),
+        missing_ok=True,
+    )
+    keys = sorted(_task_key(t) for t in terminal)
+    local_out = os.path.join(local_cache_dir, os.path.basename(output_path_or_uri))
+    if not local_out.endswith(".json"):
+        local_out += ".json"
+    payload = {
+        "source": encode_logs_prefix,
+        "statuses": sorted(statuses),
+        "num_views": len(keys),
+        "views": keys,
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(local_out)), exist_ok=True)
+    with open(local_out, "w") as f:
+        json.dump(payload, f)
+    if _is_s3_uri(output_path_or_uri):
+        out_uri = output_path_or_uri
+        if not out_uri.endswith(".json"):
+            out_uri += ".json"
+        if not s3_cp_file(local_out, out_uri, retries=3):
+            raise RuntimeError(f"failed to upload snapshot to {out_uri}")
+        print(f"[snapshot] wrote {len(keys)} terminal views to {out_uri}")
+    else:
+        print(f"[snapshot] wrote {len(keys)} terminal views to {local_out}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Batch-encode O-Voxel view tars into shape+SS latents (objxl S3 layout).")
@@ -418,6 +518,24 @@ def main():
                         default="microsoft/TRELLIS-image-large/ckpts/ss_enc_conv3d_16l8_fp16")
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world_size", type=int, default=1)
+    parser.add_argument("--task_shard_mode", type=str, default="filter_then_shard",
+                        choices=("filter_then_shard",
+                                 "shard_then_filter",
+                                 "snapshot_filter_then_shard_then_filter"),
+                        help="Task ordering mode. filter_then_shard preserves the "
+                             "old behavior. shard_then_filter shards the voxel-success "
+                             "pool first, then applies this rank's progress. "
+                             "snapshot_filter_then_shard_then_filter first removes "
+                             "views in --global_progress_snapshot, shards the frozen "
+                             "remainder, then applies this rank's live progress.")
+    parser.add_argument("--global_progress_snapshot", type=str, default=None,
+                        help="Frozen snapshot JSON used by "
+                             "snapshot_filter_then_shard_then_filter. Supports s3:// "
+                             "or local paths.")
+    parser.add_argument("--write_global_progress_snapshot", type=str, default=None,
+                        help="Summarize current encode_progress_*.json into this "
+                             "snapshot path and exit. Supports s3:// or local paths. "
+                             "Use the same file for all ranks in a later snapshot run.")
     parser.add_argument("--state_dir", type=str, default="/local-ssd/encode_objxl_state")
     parser.add_argument("--tmp_dir", type=str, default="/local-ssd/encode_objxl_tmp")
     parser.add_argument("--max_items", type=int, default=None)
@@ -446,6 +564,20 @@ def main():
     os.makedirs(args.tmp_dir, exist_ok=True)
     print(f"[main] rank={args.rank}/{args.world_size} state={args.state_dir} "
           f"tmp={args.tmp_dir} res={args.resolution} ss_res={args.ss_resolution}")
+    print(f"[main] task_shard_mode={args.task_shard_mode} "
+          f"global_progress_snapshot={args.global_progress_snapshot or '<unset>'}")
+
+    encode_logs_prefix = f"{args.s3_output_root.rstrip('/')}/logs{args.log_suffix}/"
+
+    if args.write_global_progress_snapshot:
+        snapshot_cache = os.path.join(args.state_dir, "write_progress_snapshot_cache")
+        write_progress_snapshot(
+            encode_logs_prefix,
+            args.write_global_progress_snapshot,
+            snapshot_cache,
+            statuses=TERMINAL_SKIP_STATUSES,
+        )
+        return
 
     # L1: gather success views from voxel-stage progress files.
     cache_dir = os.path.join(args.state_dir, "voxel_progress_cache")
@@ -454,31 +586,47 @@ def main():
     all_tasks.sort()
     print(f"[main] voxel-success views: {len(all_tasks)}")
 
-    # ---- Cross-rank skip ----
-    # Pull every encode_progress_*.json that any rank has written so far and
-    # subtract terminal-status views from the global task pool BEFORE sharding.
-    # This way, if world_size changes between launches (or a rank is
-    # re-submitted), no rank re-encodes work another rank has already done.
-    cross_cache = os.path.join(args.state_dir, "cross_rank_progress_cache")
-    encode_logs_prefix = f"{args.s3_output_root.rstrip('/')}/logs{args.log_suffix}/"
-    cross_done = summarize_finished_views_from_logs(
-        encode_logs_prefix, cross_cache,
-        filename_prefix="encode_progress_",
-        statuses=tuple(TERMINAL_SKIP_STATUSES),
-        missing_ok=True,
-    )
-    cross_done_set = set(cross_done)
-    n_global = len(all_tasks)
-    all_tasks = [t for t in all_tasks if t not in cross_done_set]
-    print(f"[main] cross-rank terminal views to skip globally: {len(cross_done_set)} "
-          f"(of {n_global} -> {len(all_tasks)} remaining)")
+    if args.task_shard_mode == "filter_then_shard":
+        # Old behavior: pull every encode_progress_*.json that any rank has
+        # written so far and subtract terminal-status views from the global task
+        # pool BEFORE sharding.
+        cross_cache = os.path.join(args.state_dir, "cross_rank_progress_cache")
+        cross_done = summarize_finished_views_from_logs(
+            encode_logs_prefix, cross_cache,
+            filename_prefix="encode_progress_",
+            statuses=tuple(TERMINAL_SKIP_STATUSES),
+            missing_ok=True,
+        )
+        cross_done_set = set(cross_done)
+        n_global = len(all_tasks)
+        all_tasks = [t for t in all_tasks if t not in cross_done_set]
+        print(f"[main] cross-rank terminal views to skip globally: {len(cross_done_set)} "
+              f"(of {n_global} -> {len(all_tasks)} remaining)")
+    elif args.task_shard_mode == "snapshot_filter_then_shard_then_filter":
+        if not args.global_progress_snapshot:
+            raise SystemExit(
+                "--global_progress_snapshot is required for "
+                "snapshot_filter_then_shard_then_filter")
+        snapshot_cache = os.path.join(args.state_dir, "global_progress_snapshot.json")
+        snapshot_done_set = load_progress_snapshot(
+            args.global_progress_snapshot,
+            snapshot_cache,
+            statuses=TERMINAL_SKIP_STATUSES,
+        )
+        n_global = len(all_tasks)
+        all_tasks = [t for t in all_tasks if t not in snapshot_done_set]
+        print(f"[main] snapshot terminal views to skip globally: {len(snapshot_done_set)} "
+              f"(of {n_global} -> {len(all_tasks)} remaining)")
+    else:
+        print("[main] cross-rank pre-shard skip disabled; sharding voxel-success pool first")
 
-    # Shard the *remaining* task pool. Slice indexing is therefore not stable
-    # across launches by design -- whatever's left gets re-divided.
+    # Shard the current task pool. In snapshot mode, the task pool is frozen by
+    # --global_progress_snapshot before slicing, so rank assignment is stable
+    # across all ranks in this launch.
     start = len(all_tasks) * args.rank // args.world_size
     end = len(all_tasks) * (args.rank + 1) // args.world_size
     my_tasks = all_tasks[start:end]
-    print(f"[main] rank {args.rank}: {len(my_tasks)} tasks (idx {start}:{end})")
+    print(f"[main] rank {args.rank}: {len(my_tasks)} raw shard tasks (idx {start}:{end})")
 
     # L2: per-rank progress (for retried-transient handling and per-rank
     # bookkeeping; cross-rank skip already excluded global terminals).

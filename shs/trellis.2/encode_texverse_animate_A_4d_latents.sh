@@ -7,7 +7,9 @@
 #
 # Usage: bash shs/trellis.2/encode_texverse_animate_A_4d_latents.sh [world_size] [rank]
 # Env (optional): MAX_ITEMS, RESOLUTION, SS_RESOLUTION, FRAME_CHUNK_SIZE,
-#                 PREFETCH, STDOUT_SYNC_INTERVAL (seconds, default 60)
+#                 PREFETCH, TASK_SHARD_MODE, GLOBAL_PROGRESS_SNAPSHOT,
+#                 WRITE_GLOBAL_PROGRESS_SNAPSHOT, STDOUT_SYNC_INTERVAL
+#                 (seconds, default 60)
 # Set FRAME_CHUNK_SIZE=1 to fall back to one-frame-per-forward (bit-exact
 # vs. the original single-frame implementation).
 # PREFETCH=N keeps N views in background CPU/IO pipeline so GPU stays busy.
@@ -36,9 +38,20 @@ VOXEL_LOGS_PREFIX="s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process
 SS_RESOLUTION="${SS_RESOLUTION:-32}"
 FRAME_CHUNK_SIZE="${FRAME_CHUNK_SIZE:-8}"
 PREFETCH="${PREFETCH:-2}"
+TASK_SHARD_MODE="${TASK_SHARD_MODE:-filter_then_shard}"
+GLOBAL_PROGRESS_SNAPSHOT="${GLOBAL_PROGRESS_SNAPSHOT:-}"
+WRITE_GLOBAL_PROGRESS_SNAPSHOT="${WRITE_GLOBAL_PROGRESS_SNAPSHOT:-}"
 MAX_ITEMS_ARG=()
 if [[ -n "${MAX_ITEMS:-}" ]]; then
     MAX_ITEMS_ARG=(--max_items "$MAX_ITEMS")
+fi
+SNAPSHOT_ARG=()
+if [[ -n "$GLOBAL_PROGRESS_SNAPSHOT" ]]; then
+    SNAPSHOT_ARG=(--global_progress_snapshot "$GLOBAL_PROGRESS_SNAPSHOT")
+fi
+WRITE_SNAPSHOT_ARG=()
+if [[ -n "$WRITE_GLOBAL_PROGRESS_SNAPSHOT" ]]; then
+    WRITE_SNAPSHOT_ARG=(--write_global_progress_snapshot "$WRITE_GLOBAL_PROGRESS_SNAPSHOT")
 fi
 
 WS=${1:-1}
@@ -94,6 +107,9 @@ echo "  s3_output_root    = $S3_OUTPUT"
 echo "  max_items         = ${MAX_ITEMS:-<unset>}"
 echo "  frame_chunk_size  = $FRAME_CHUNK_SIZE"
 echo "  prefetch          = $PREFETCH"
+echo "  task_shard_mode   = $TASK_SHARD_MODE"
+echo "  global_snapshot   = ${GLOBAL_PROGRESS_SNAPSHOT:-<unset>}"
+echo "  write_snapshot    = ${WRITE_GLOBAL_PROGRESS_SNAPSHOT:-<unset>}"
 echo "  local_log         = $LOCAL_LOG"
 echo "  s3_log            = $S3_STDOUT_LOG  (sync every ${STDOUT_SYNC_INTERVAL}s)"
 echo "================================================================"
@@ -109,7 +125,10 @@ python -u tools/encode_ovoxel_to_latents_objxl.py \
     --ss_resolution     "$SS_RESOLUTION" \
     --frame_chunk_size  "$FRAME_CHUNK_SIZE" \
     --prefetch          "$PREFETCH" \
+    --task_shard_mode   "$TASK_SHARD_MODE" \
     --state_dir /local-ssd/encode_texverse_A_state \
     --tmp_dir   /local-ssd/encode_texverse_A_tmp \
     --world_size "$WS" --rank "$RANK" \
+    "${SNAPSHOT_ARG[@]}" \
+    "${WRITE_SNAPSHOT_ARG[@]}" \
     "${MAX_ITEMS_ARG[@]}"
