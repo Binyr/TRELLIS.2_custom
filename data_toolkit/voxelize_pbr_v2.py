@@ -2,9 +2,10 @@
 """
 voxelize_pbr_v2.py - Voxelize 4D animated objects PBR frame-by-frame.
 
-Combines pbr_shared pickle (materials, faces, UVs, mat_ids) with
-result_mesh.npz (vertices_seq per frame) to produce per-view .tar files
-containing per-frame .vxz via o_voxel.convert.blender_dump_to_volumetric_attr().
+Combines pbr_shared pickle with dynamic mesh geometry to produce per-view .tar
+files containing per-frame .vxz via o_voxel.convert.blender_dump_to_volumetric_attr().
+Newer ObjXL PBR pickles may carry vertices_seq/faces directly; older 4D pickles
+still use result_mesh.npz for vertices_seq/faces.
 
 Features:
 - Per-view scheduling granularity: each task = one (object, view) pair
@@ -161,6 +162,29 @@ def _build_pbr_dump(pbr_shared: dict, frame_verts: np.ndarray, pbr_faces: np.nda
     return dump
 
 
+def _pbr_has_self_contained_mesh(pbr_shared: dict) -> bool:
+    objects = pbr_shared.get('objects') or []
+    if not objects:
+        return False
+    obj_data = objects[0]
+    return obj_data.get('vertices_seq') is not None and obj_data.get('faces') is not None
+
+
+def _load_geometry_for_pbr(pbr_shared: dict, mesh_npz_path: str):
+    obj_data = pbr_shared['objects'][0]
+    if _pbr_has_self_contained_mesh(pbr_shared):
+        vertices_seq = np.asarray(obj_data['vertices_seq']).copy()
+        faces = np.asarray(obj_data['faces']).copy()
+        return vertices_seq, faces, 'pbr_shared'
+
+    if not os.path.exists(mesh_npz_path):
+        return None, None, 'missing_mesh'
+    with np.load(mesh_npz_path) as mesh_data:
+        vertices_seq = mesh_data['vertices'].copy()
+        faces = mesh_data['faces'].copy()
+    return vertices_seq, faces, 'result_mesh'
+
+
 def voxelize_pbr_one_view(
     shard_id: str,
     obj_id: str,
@@ -188,30 +212,27 @@ def voxelize_pbr_one_view(
     with open(pbr_path, 'rb') as f:
         pbr_shared = pickle.load(f)
 
-    mesh_npz_path = os.path.join(rendered_dir, 'result_mesh.npz')
-    if not os.path.exists(mesh_npz_path):
-        return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'missing_mesh', 'num_frames': 0}
-
     camera_views = load_camera_w2c_rotations(rendered_dir)
     if camera_views is None or view_idx not in camera_views:
         return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'missing_camera', 'num_frames': 0}
 
     w2c_rot = camera_views[view_idx]
 
-    with np.load(mesh_npz_path) as mesh_data:
-        vertices_seq = mesh_data['vertices'].copy()
-        mesh_faces = mesh_data['faces'].copy()
+    mesh_npz_path = os.path.join(rendered_dir, 'result_mesh.npz')
+    vertices_seq, geometry_faces, geometry_source = _load_geometry_for_pbr(pbr_shared, mesh_npz_path)
+    if geometry_source == 'missing_mesh':
+        return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'missing_mesh', 'num_frames': 0}
     t_read = time.time() - t_read_start
 
-    num_faces = mesh_faces.shape[0]
+    pbr_faces = pbr_shared['objects'][0]['faces']
+    num_faces = pbr_faces.shape[0]
     if num_faces > 500000:
         return {
             'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx,
             'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces,
         }
 
-    pbr_faces = pbr_shared['objects'][0]['faces']
-    if mesh_faces.shape != pbr_faces.shape:
+    if geometry_faces.shape != pbr_faces.shape:
         return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'face_mismatch', 'num_frames': 0}
 
     num_frames = vertices_seq.shape[0]
@@ -301,7 +322,7 @@ def voxelize_pbr_one_view(
 
         shutil.rmtree(local_view_dir, ignore_errors=True)
 
-    del vertices_seq, mesh_faces, pbr_shared
+    del vertices_seq, geometry_faces, pbr_faces, pbr_shared
     print(
         f"[TIMING] {shard_id}/{obj_id}/view_{view_idx:02d} read={t_read:.1f}s "
         f"compute={t_compute:.1f}s write={t_write:.1f}s total={t_read + t_compute + t_write:.1f}s "
@@ -314,6 +335,7 @@ def voxelize_pbr_one_view(
         'view_idx': view_idx,
         'status': view_status,
         'num_frames': num_frames,
+        'geometry_source': geometry_source,
         't_read': round(t_read, 2),
         't_compute': round(t_compute, 2),
         't_write': round(t_write, 2),
