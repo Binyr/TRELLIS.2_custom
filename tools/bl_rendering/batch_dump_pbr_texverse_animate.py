@@ -23,6 +23,8 @@ from batch_render_texverse_animate import resolve_object_path
 
 DEFAULT_VIEW_CANDIDATES = [0, 4, 8, 12]
 TERMINAL_SKIP_STATUSES = {"success"}
+LOCAL_SSD_DATA_PREFIX = "/local-ssd/data/"
+THREED_CODE_DATA_PREFIX = "/threed-code/yanruibin/efs/4D_video_data_process/data/"
 
 
 def _is_s3_uri(path: str) -> bool:
@@ -74,6 +76,12 @@ def load_manifest(manifest_path: str, local_state_dir: str) -> list:
     with open(manifest_path) as f:
         data = json.load(f)
     return data["manifest"]
+
+
+def canonicalize_texverse_zip_path(path: str) -> str:
+    if path.startswith(LOCAL_SSD_DATA_PREFIX):
+        return THREED_CODE_DATA_PREFIX + path[len(LOCAL_SSD_DATA_PREFIX):]
+    return path
 
 
 class ProgressStore:
@@ -277,7 +285,7 @@ def main():
     success = skip = fail = 0
     for idx, item in enumerate(manifest):
         obj_id = item["id"]
-        zip_path = item["zip_path"]
+        zip_path = canonicalize_texverse_zip_path(item["zip_path"])
         file_path_in_zip = item["file_path_in_zip"]
         stage = item.get("stage", "A")
         extension = item.get("extension", "")
