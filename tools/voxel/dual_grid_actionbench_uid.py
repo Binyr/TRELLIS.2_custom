@@ -17,8 +17,10 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import traceback
 from datetime import datetime, timezone
@@ -38,6 +40,76 @@ TERMINAL_SKIP_STATUSES = {
     "dual_grid_error",
     "worker_error",
 }
+
+
+def _is_s3_uri(path: str) -> bool:
+    return isinstance(path, str) and path.startswith("s3://")
+
+
+def _join_uri(root: str, *parts: str) -> str:
+    if _is_s3_uri(root):
+        return root.rstrip("/") + "/" + "/".join(str(p).strip("/") for p in parts)
+    return os.path.join(root, *map(str, parts))
+
+
+def run_aws(args, retries: int = 2, sleep_s: float = 2.0) -> subprocess.CompletedProcess:
+    last = None
+    for attempt in range(retries + 1):
+        proc = subprocess.run(["aws"] + args, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return proc
+        last = proc
+        if attempt < retries:
+            time.sleep(sleep_s * (attempt + 1))
+    return last
+
+
+def s3_get_file(s3_uri: str, local_path: str, retries: int = 2) -> bool:
+    os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+    proc = run_aws(["s3", "cp", "--only-show-errors", s3_uri, local_path], retries=retries)
+    if proc.returncode != 0:
+        print(f"[s3] cp FAILED {s3_uri} -> {local_path}: {proc.stderr.strip()[:300]}")
+        return False
+    return True
+
+
+def s3_cp_file(local_path: str, s3_uri: str, retries: int = 2) -> bool:
+    proc = run_aws(["s3", "cp", "--only-show-errors", local_path, s3_uri], retries=retries)
+    if proc.returncode != 0:
+        print(f"[s3] cp FAILED {local_path} -> {s3_uri}: {proc.stderr.strip()[:300]}")
+        return False
+    return True
+
+
+def s3_exists_file(s3_uri: str) -> bool:
+    proc = run_aws(["s3", "ls", s3_uri], retries=1)
+    return proc.returncode == 0 and s3_uri.rsplit("/", 1)[-1] in proc.stdout
+
+
+def copy_uri_to_local(src: str, dst: str) -> bool:
+    if _is_s3_uri(src):
+        return s3_get_file(src, dst, retries=2)
+    if not os.path.isfile(src):
+        return False
+    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+    shutil.copyfile(src, dst)
+    return True
+
+
+def copy_local_to_uri(src: str, dst: str) -> bool:
+    if _is_s3_uri(dst):
+        return s3_cp_file(src, dst, retries=2)
+    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+    tmp = f"{dst}.tmp.{os.getpid()}"
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+    return True
+
+
+def uri_exists(path: str) -> bool:
+    if _is_s3_uri(path):
+        return s3_exists_file(path)
+    return os.path.isfile(path)
 
 
 def log_suffix_for_resolutions(resolutions: list[int]) -> str:
@@ -69,8 +141,23 @@ def parse_view_idx(view_id) -> int:
 
 
 def load_tasks(ann_file: str, split: str) -> list[tuple[str, int, dict]]:
-    with open(ann_file) as f:
-        raw = json.load(f)
+    local_ann = ann_file
+    tmp_ann = None
+    if _is_s3_uri(ann_file):
+        fd, tmp_ann = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        if not s3_get_file(ann_file, tmp_ann, retries=3):
+            raise RuntimeError(f"failed to download ann_file: {ann_file}")
+        local_ann = tmp_ann
+    try:
+        with open(local_ann) as f:
+            raw = json.load(f)
+    finally:
+        if tmp_ann:
+            try:
+                os.unlink(tmp_ann)
+            except OSError:
+                pass
 
     if isinstance(raw, dict):
         if split:
@@ -124,10 +211,11 @@ class ProgressStore:
                  push_min_interval_s: float = 30.0):
         os.makedirs(local_state_dir, exist_ok=True)
         self.rank = int(rank)
-        self.logs_root = os.path.join(output_root, f"logs{log_suffix}")
-        os.makedirs(self.logs_root, exist_ok=True)
-        self.remote_progress = os.path.join(self.logs_root, f"voxel_progress_{rank}.json")
-        self.remote_status = os.path.join(self.logs_root, f"voxel_status_{rank}.log")
+        self.logs_root = _join_uri(output_root, f"logs{log_suffix}")
+        if not _is_s3_uri(self.logs_root):
+            os.makedirs(self.logs_root, exist_ok=True)
+        self.remote_progress = _join_uri(self.logs_root, f"voxel_progress_{rank}.json")
+        self.remote_status = _join_uri(self.logs_root, f"voxel_status_{rank}.log")
         self.local_progress = os.path.join(local_state_dir, f"voxel_progress_{rank}{log_suffix}.json")
         self.local_status = os.path.join(local_state_dir, f"voxel_status_{rank}{log_suffix}.log")
         self.progress = {}
@@ -141,9 +229,24 @@ class ProgressStore:
         return f"{uid}/view_{int(view_idx):02d}"
 
     def load(self):
-        if os.path.isfile(self.remote_progress):
+        if _is_s3_uri(self.remote_progress):
+            ok = s3_get_file(self.remote_progress, self.local_progress, retries=1)
+            if ok:
+                try:
+                    with open(self.local_progress) as f:
+                        self.progress = json.load(f)
+                    print(f"[progress] loaded {len(self.progress)} entries from {self.remote_progress}")
+                except Exception as exc:
+                    print(f"[progress] parse failed ({exc}), starting empty")
+                    self.progress = {}
+            else:
+                print(f"[progress] no progress at {self.remote_progress}, starting empty")
+                self.progress = {}
+            if not s3_get_file(self.remote_status, self.local_status, retries=1):
+                open(self.local_status, "w").close()
+        elif os.path.isfile(self.remote_progress):
             try:
-                shutil.copy2(self.remote_progress, self.local_progress)
+                shutil.copyfile(self.remote_progress, self.local_progress)
                 with open(self.local_progress) as f:
                     self.progress = json.load(f)
                 print(f"[progress] loaded {len(self.progress)} entries from {self.remote_progress}")
@@ -154,7 +257,7 @@ class ProgressStore:
             print(f"[progress] no progress at {self.remote_progress}, starting empty")
             self.progress = {}
         if os.path.isfile(self.remote_status):
-            shutil.copy2(self.remote_status, self.local_status)
+            shutil.copyfile(self.remote_status, self.local_status)
         else:
             open(self.local_status, "w").close()
 
@@ -184,18 +287,22 @@ class ProgressStore:
             self.flush()
 
     def flush(self):
-        os.makedirs(self.logs_root, exist_ok=True)
-        shutil.copy2(self.local_progress, self.remote_progress)
-        shutil.copy2(self.local_status, self.remote_status)
+        if _is_s3_uri(self.logs_root):
+            s3_cp_file(self.local_progress, self.remote_progress, retries=1)
+            s3_cp_file(self.local_status, self.remote_status, retries=1)
+        else:
+            os.makedirs(self.logs_root, exist_ok=True)
+            shutil.copyfile(self.local_progress, self.remote_progress)
+            shutil.copyfile(self.local_status, self.remote_status)
         self._updates_since_push = 0
         self._last_push_ts = time.time()
 
 
 def write_error_log(output_root: str, log_suffix: str, rank: int, uid: str,
                     view_idx: int, header: str, body: str):
-    log_dir = os.path.join(output_root, f"_logs{log_suffix}", f"rank_{rank}")
-    os.makedirs(log_dir, exist_ok=True)
-    path = os.path.join(log_dir, f"{uid}_view_{view_idx:02d}.txt")
+    log_dir = _join_uri(output_root, f"_logs{log_suffix}", f"rank_{rank}")
+    local_dir = tempfile.mkdtemp(prefix="actionbench_voxel_error_")
+    path = os.path.join(local_dir, f"{uid}_view_{view_idx:02d}.txt")
     with open(path, "w") as f:
         f.write(f"uid: {uid}\n")
         f.write(f"view_idx: {view_idx}\n")
@@ -203,27 +310,32 @@ def write_error_log(output_root: str, log_suffix: str, rank: int, uid: str,
         f.write(f"timestamp: {datetime.now(timezone.utc).isoformat()}\n")
         f.write(f"header: {header}\n\n")
         f.write(body)
+    if _is_s3_uri(log_dir):
+        s3_cp_file(path, _join_uri(log_dir, os.path.basename(path)), retries=1)
+        shutil.rmtree(local_dir, ignore_errors=True)
+    else:
+        os.makedirs(log_dir, exist_ok=True)
+        shutil.copyfile(path, os.path.join(log_dir, os.path.basename(path)))
+        shutil.rmtree(local_dir, ignore_errors=True)
 
 
 def output_exists(output_root: str, resolutions: list[int], uid: str, view_idx: int) -> bool:
     for res in resolutions:
-        base = os.path.join(output_root, str(res), uid, f"view_{view_idx:02d}")
-        if not (os.path.isfile(f"{base}.tar") and os.path.isfile(f"{base}_meta.json")):
+        base = _join_uri(output_root, str(res), uid, f"view_{view_idx:02d}")
+        if not (uri_exists(f"{base}.tar") and uri_exists(f"{base}_meta.json")):
             return False
     return True
 
 
 def copy_inputs_to_tmp(input_root: str, uid: str, view_dir: str) -> tuple[str | None, str | None]:
-    src_mesh = os.path.join(input_root, uid, "mesh.npz")
-    src_json = os.path.join(input_root, uid, "result.json")
-    if not os.path.isfile(src_mesh):
-        return None, None
-    if not os.path.isfile(src_json):
-        return src_mesh, None
+    src_mesh = _join_uri(input_root, uid, "mesh.npz")
+    src_json = _join_uri(input_root, uid, "result.json")
     local_mesh = os.path.join(view_dir, "mesh.npz")
     local_json = os.path.join(view_dir, "result.json")
-    shutil.copy2(src_mesh, local_mesh)
-    shutil.copy2(src_json, local_json)
+    if not copy_uri_to_local(src_mesh, local_mesh):
+        return None, None
+    if not copy_uri_to_local(src_json, local_json):
+        return src_mesh, None
     return local_mesh, local_json
 
 
@@ -380,18 +492,16 @@ def voxelize_one_view(uid: str, view_idx: int, input_root: str, output_root: str
                     "mesh_frame_indices": selected_mesh_frame_indices,
                 }, f)
 
-            out_dir = os.path.join(output_root, str(res), uid)
-            os.makedirs(out_dir, exist_ok=True)
-            final_base = os.path.join(out_dir, f"view_{view_idx:02d}")
-            tmp_tar = f"{final_base}.tar.tmp.{os.getpid()}"
-            tmp_meta = f"{final_base}_meta.json.tmp.{os.getpid()}"
+            final_base = _join_uri(output_root, str(res), uid, f"view_{view_idx:02d}")
             tp = time.time()
-            shutil.copy2(local_tar, tmp_tar)
-            shutil.copy2(local_meta, tmp_meta)
-            os.replace(tmp_tar, f"{final_base}.tar")
-            os.replace(tmp_meta, f"{final_base}_meta.json")
+            if not copy_local_to_uri(local_tar, f"{final_base}.tar"):
+                return {"status": "upload_failed", "num_frames": num_frames,
+                        "num_frames_orig": num_frames_orig, "res": res}
+            if not copy_local_to_uri(local_meta, f"{final_base}_meta.json"):
+                return {"status": "upload_failed", "num_frames": num_frames,
+                        "num_frames_orig": num_frames_orig, "res": res, "stage": "meta"}
             timings["t_publish"] += time.time() - tp
-            tar_size_mb = os.path.getsize(f"{final_base}.tar") / 1024 / 1024
+            tar_size_mb = os.path.getsize(local_tar) / 1024 / 1024
             print(f"[timing] {uid[:16]}/view_{view_idx:02d} res={res} "
                   f"tar_mb={tar_size_mb:.1f} t_tar={timings['t_tar']:.2f}s "
                   f"t_publish={timings['t_publish']:.2f}s")

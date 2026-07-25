@@ -9,7 +9,7 @@
 #   MAX_FRAMES=0              # 0 means all frames
 #   FRAME_SAMPLING=all
 #   MAX_ITEMS=1               # debug only
-#   DATA_ROOT=/threed-code/yanruibin/efs/4D_video_data_process/data
+#   S3_DATA_ROOT=s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data
 #   SCRATCH_ROOT=/tmp
 
 set -uo pipefail
@@ -17,14 +17,19 @@ export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export PYTHONUNBUFFERED=1
 
+if [[ -f /etc/profile.d/koala_env.sh ]]; then
+    # shellcheck disable=SC1091
+    source /etc/profile.d/koala_env.sh
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
-DATA_ROOT="${DATA_ROOT:-/threed-code/yanruibin/efs/4D_video_data_process/data}"
-INPUT_ROOT="${INPUT_ROOT:-${DATA_ROOT}/actionbench/rendered_v1_1view_120f_uid}"
+S3_DATA_ROOT="${S3_DATA_ROOT:-s3://arcwm-code-us-west-2/yanruibin/efs/4D_video_data_process/data}"
+INPUT_ROOT="${INPUT_ROOT:-${S3_DATA_ROOT}/actionbench/rendered_v1_1view_120f_uid}"
 ANN_FILE="${ANN_FILE:-${INPUT_ROOT}/anns_min61_sub20.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${DATA_ROOT}/actionbench/dual_grid_v1_1view_120f_uid_ovoxel}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${S3_DATA_ROOT}/actionbench/dual_grid_v1_1view_120f_uid_ovoxel}"
 
 RESOLUTION="${RESOLUTION:-1024}"
 MAX_FRAMES="${MAX_FRAMES:-0}"
@@ -46,11 +51,11 @@ REMOTE_STDOUT_DIR="${OUTPUT_ROOT}/_logs${LOG_SUFFIX}/std_outs"
 REMOTE_LOG="${REMOTE_STDOUT_DIR}/rank_${RANK}.log"
 STDOUT_SYNC_INTERVAL="${STDOUT_SYNC_INTERVAL:-60}"
 
-mkdir -p "$LOCAL_STDOUT_DIR" "$REMOTE_STDOUT_DIR"
+mkdir -p "$LOCAL_STDOUT_DIR"
 
 sync_stdout_quiet() {
     if [[ -f "$LOCAL_LOG" ]]; then
-        cp "$LOCAL_LOG" "$REMOTE_LOG" || true
+        aws s3 cp --only-show-errors "$LOCAL_LOG" "$REMOTE_LOG" || true
     fi
 }
 
