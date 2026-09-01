@@ -83,11 +83,16 @@ def s3_put(local: Path, uri: str, retries: int = 2) -> bool:
     return True
 
 
-def list_object_tasks(s3_root: str, resolution: int, suffix: str) -> set[str]:
+def list_object_tasks(
+    s3_root: str, resolution: int, suffix: str, *, missing_ok: bool = False
+) -> set[str]:
     """Return view task IDs for matching objects below an S3 resolution root."""
     prefix = f"{s3_root.rstrip('/')}/{resolution}/"
     proc = run_aws(["s3", "ls", prefix, "--recursive"], retries=3)
     if proc.returncode != 0:
+        if missing_ok:
+            print(f"[objects] no existing objects under {prefix}; treating as empty", flush=True)
+            return set()
         raise RuntimeError(f"cannot list {prefix}: {proc.stderr.strip()[:500]}")
     root_key = s3_root.removeprefix("s3://").split("/", 1)[1].strip("/")
     key_prefix = f"{root_key}/{resolution}/"
@@ -309,7 +314,9 @@ def main():
     # Freeze assignment before consulting mutable completion state. Round-robin
     # sharding spreads lexicographically clustered objects across ranks.
     shard_ids = all_tasks[args.rank :: args.world_size]
-    completed_outputs = list_object_tasks(args.s3_output_root, args.resolution, ".npz")
+    completed_outputs = list_object_tasks(
+        args.s3_output_root, args.resolution, ".npz", missing_ok=True
+    )
     shard_ids = [task_id for task_id in shard_ids if task_id not in completed_outputs]
     pending = [
         (
