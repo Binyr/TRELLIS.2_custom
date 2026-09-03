@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Voxelize the original 4D source into 256 and 64 geometry O-Voxels.
+# Voxelize the original 4D source into 256, 128, and 64 geometry O-Voxels.
 #
 # Usage:
 #   bash shs/trellis.2/dual_grid_4d_256_64.sh [world_size] [rank]
 #
-# The two resolutions are produced from the same loaded mesh/view.  No 512 or
-# 1024 finished-view list is used: those lists do not prove that 256/64 outputs
-# exist.  Resume state and stdout live under log_256_64.
+# The three resolutions are produced from the same loaded mesh/view.  No 512 or
+# 1024 finished-view list is used: those lists do not prove that 256/128/64
+# outputs exist. Resume state and stdout live under log_256_128_64.
 set -euo pipefail
 
 export PYTHONUNBUFFERED=1
 
 WORLD_SIZE="${1:-1}"
 RANK="${2:-0}"
-RESOLUTIONS="${RESOLUTIONS:-256,64}"
+RESOLUTIONS="${RESOLUTIONS:-256,128,64}"
 RES_TAG="${RESOLUTIONS//,/_}"
 
 DATA_ROOT="${DATA_ROOT:-/threed-code/yanruibin/efs/4D_video_data_process/data}"
