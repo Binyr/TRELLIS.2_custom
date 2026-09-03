@@ -41,6 +41,20 @@ import o_voxel
 EXPECTED_VIEWS = [0, 2, 4, 6, 8, 10, 12, 14]
 
 
+def pick_frame_sel(num_frames: int, max_frames: int, mode: str) -> list[int]:
+    """Select mesh/RGB positions while preserving their original 0-based IDs."""
+    if max_frames <= 0 or num_frames <= max_frames:
+        return list(range(num_frames))
+    if mode == 'center':
+        start = (num_frames - max_frames) // 2
+        return list(range(start, start + max_frames))
+    if mode == 'uniform':
+        return [int(round(x)) for x in np.linspace(0, num_frames - 1, max_frames)]
+    if mode == 'head':
+        return list(range(max_frames))
+    raise ValueError(f'unknown frame_sampling mode: {mode}')
+
+
 def parse_entry(entry: str):
     """
     Parse a json entry path into shard_id and obj_id.
@@ -51,6 +65,25 @@ def parse_entry(entry: str):
     shard_with_suffix = parts[-2]
     shard_id = shard_with_suffix.split('_static_camera_distance_v3')[0]
     return shard_id, obj_id
+
+
+def view_outputs_complete(
+    output_root: str,
+    resolutions: list[int],
+    shard_id: str,
+    obj_id: str,
+    view_idx: int,
+    require_meta: bool,
+) -> bool:
+    for res in resolutions:
+        output_dir = os.path.join(output_root, str(res), shard_id, obj_id)
+        tar_path = os.path.join(output_dir, f'view_{view_idx:02d}.tar')
+        meta_path = os.path.join(output_dir, f'view_{view_idx:02d}_meta.json')
+        if not os.path.exists(tar_path):
+            return False
+        if require_meta and not os.path.exists(meta_path):
+            return False
+    return True
 
 
 def load_camera_w2c_rotations(rendered_dir: str, view_start=0, view_stride=2):
@@ -84,6 +117,9 @@ def dual_grid_one_view(
     resolutions: list,
     tmp_dir: str = '/tmp',
     debug: bool = False,
+    max_frames: int = 0,
+    frame_sampling: str = 'center',
+    write_frame_meta: bool = False,
 ):
     """
     Convert all frames of one object for ONE camera view to geometry O-Voxels.
@@ -107,15 +143,35 @@ def dual_grid_one_view(
     with np.load(mesh_npz_path) as mesh_data:
         vertices_seq = mesh_data['vertices'].copy()  # (T, N, 3) float16
         faces = mesh_data['faces'].copy()             # (F, 3) int32
+        animation_frame_indices = (
+            mesh_data['frame_indices'].copy()
+            if 'frame_indices' in mesh_data.files
+            else None
+        )
     t_read = time.time() - t_read_start
 
     num_faces = faces.shape[0]
     if num_faces > 500000:
         return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}
 
-    num_frames = vertices_seq.shape[0]
+    num_frames_orig = int(vertices_seq.shape[0])
+    if animation_frame_indices is not None and len(animation_frame_indices) != num_frames_orig:
+        return {
+            'shard_id': shard_id,
+            'obj_id': obj_id,
+            'view_idx': view_idx,
+            'status': 'frame_metadata_mismatch',
+            'num_frames': 0,
+            'num_frames_orig': num_frames_orig,
+            'error': (
+                f'frame_indices has {len(animation_frame_indices)} entries but '
+                f'vertices has {num_frames_orig} frames'
+            ),
+        }
+    frame_sel = pick_frame_sel(num_frames_orig, max_frames, frame_sampling)
     if debug:
-        num_frames = min(num_frames, 1)
+        frame_sel = frame_sel[:1]
+    num_frames = len(frame_sel)
     faces_t = torch.from_numpy(faces).long()
 
     view_status = 'success'
@@ -125,9 +181,14 @@ def dual_grid_one_view(
         output_dir = os.path.join(output_root, str(res), shard_id, obj_id)
         os.makedirs(output_dir, exist_ok=True)
         tar_path = os.path.join(output_dir, f'view_{view_idx:02d}.tar')
+        meta_path = os.path.join(output_dir, f'view_{view_idx:02d}_meta.json')
 
-        # Skip if tar already exists
-        if os.path.exists(tar_path):
+        # Frame-aware outputs use the sidecar as the completion marker. Existing
+        # all-frame pipelines retain their historical tar-only resume behavior.
+        output_complete = os.path.exists(tar_path) and (
+            not write_frame_meta or os.path.exists(meta_path)
+        )
+        if output_complete:
             continue
 
         # Local SSD temp directory for this view's vxz files
@@ -136,7 +197,7 @@ def dual_grid_one_view(
 
         # Compute all frames, write vxz to local SSD
         frame_files = []  # list of (frame_idx, local_path)
-        for frame_idx in range(num_frames):
+        for frame_idx in frame_sel:
             frame_verts = vertices_seq[frame_idx].astype(np.float32)
             frame_verts = frame_verts @ w2c_rot.T  # world -> camera (rotation only)
             frame_verts = np.clip(frame_verts, -0.5, 0.5)
@@ -185,20 +246,63 @@ def dual_grid_one_view(
                 except NameError:
                     pass
 
-        # Pack all vxz files into a tar on local SSD, then copy to S3
-        if frame_files:
+        # With frame metadata enabled, never publish a partial-frame archive.
+        have_all_selected_frames = len(frame_files) == num_frames
+        if frame_files and (have_all_selected_frames or not write_frame_meta):
             t0 = time.time()
             local_tar_path = os.path.join(local_view_dir, 'view.tar')
             with tarfile.open(local_tar_path, 'w') as tar:
                 for fi, fpath in sorted(frame_files):
                     tar.add(fpath, arcname=f'{fi:06d}.vxz')
             t_tar = time.time() - t0
-            # Single copy to S3
             t0 = time.time()
-            os.system(f'cp "{local_tar_path}" "{tar_path}"')
+            if write_frame_meta:
+                local_meta_path = os.path.join(local_view_dir, 'view_meta.json')
+                source_animation_frames = (
+                    None
+                    if animation_frame_indices is None
+                    else [int(animation_frame_indices[i]) for i in frame_sel]
+                )
+                with open(local_meta_path, 'w') as f:
+                    json.dump({
+                        'schema_version': 1,
+                        'shard_id': shard_id,
+                        'obj_id': obj_id,
+                        'view_idx': int(view_idx),
+                        'resolution': int(res),
+                        'num_frames_orig': num_frames_orig,
+                        'num_frames': num_frames,
+                        'max_frames': int(max_frames),
+                        'frame_sampling': frame_sampling,
+                        'frame_sel': [int(i) for i in frame_sel],
+                        'rgb_frame_indices_0based': [int(i) for i in frame_sel],
+                        'rgb_frame_numbers_1based': [int(i) + 1 for i in frame_sel],
+                        'source_animation_frame_indices': source_animation_frames,
+                        'vxz_frame_ids': [int(i) for i in frame_sel],
+                        'rgb_mp4': f'result_rgb_mp4/view_{view_idx:02d}.mp4',
+                    }, f)
+                try:
+                    # Publish tar first and metadata last; both are required for
+                    # frame-aware resume, so a partial copy is never complete.
+                    shutil.copy2(local_tar_path, tar_path)
+                    shutil.copy2(local_meta_path, meta_path)
+                except Exception as exc:
+                    print(
+                        f'[ERROR] output copy failed: {shard_id}/{obj_id} '
+                        f'view={view_idx} res={res}: {exc}'
+                    )
+                    view_status = 'error'
+            else:
+                os.system(f'cp "{local_tar_path}" "{tar_path}"')
             t_cp = time.time() - t0
             t_write += t_tar + t_cp
             print(f"[TIMING] tar={t_tar:.3f}s cp={t_cp:.3f}s")
+        elif write_frame_meta:
+            print(
+                f'[ERROR] refusing partial output: {shard_id}/{obj_id} '
+                f'view={view_idx} res={res} frames={len(frame_files)}/{num_frames}'
+            )
+            view_status = 'error'
 
         # Clean up local temp dir
         shutil.rmtree(local_view_dir, ignore_errors=True)
@@ -206,6 +310,8 @@ def dual_grid_one_view(
     del vertices_seq, faces, faces_t
     print(f"[TIMING] {shard_id}/{obj_id}/view_{view_idx:02d} read={t_read:.1f}s compute={t_compute:.1f}s write={t_write:.1f}s total={t_read+t_compute+t_write:.1f}s frames={num_frames}")
     return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': view_status, 'num_frames': num_frames,
+            'num_frames_orig': num_frames_orig, 'frame_sampling': frame_sampling,
+            'frame_sel': [int(i) for i in frame_sel],
             't_read': round(t_read, 2), 't_compute': round(t_compute, 2), 't_write': round(t_write, 2)}
 
 
@@ -235,7 +341,8 @@ def append_status_log(status_log_path: str, line: str):
         f.write(existing + line + '\n')
 
 
-def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, tmp_dir='/tmp', debug=False):
+def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, tmp_dir='/tmp', debug=False,
+                    max_frames=0, frame_sampling='center', write_frame_meta=False):
     """Wrapper for Pool.imap_unordered: processes one (shard_id, obj_id, view_idx) task."""
     shard_id, obj_id, view_idx = args_tuple
     try:
@@ -248,6 +355,9 @@ def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, tmp_dir
             resolutions=resolutions,
             tmp_dir=tmp_dir,
             debug=debug,
+            max_frames=max_frames,
+            frame_sampling=frame_sampling,
+            write_frame_meta=write_frame_meta,
         )
     except Exception as e:
         print(f"[ERROR] {shard_id}/{obj_id}/view_{view_idx:02d}: {e}")
@@ -281,10 +391,24 @@ def main():
                         help='Debug mode: only process 1 view and 1 frame per object')
     parser.add_argument('--tmp_dir', type=str, default='/local-ssd/tmp_dual_grid',
                         help='Local SSD path for temp files (default: /local-ssd/tmp_dual_grid)')
+    parser.add_argument('--max_frames', type=int, default=0,
+                        help='Maximum selected frames per view; 0 preserves all frames')
+    parser.add_argument('--frame_sampling', type=str, default='center',
+                        choices=['center', 'uniform', 'head'],
+                        help='Frame selection used when num_frames exceeds --max_frames')
+    parser.add_argument('--write_frame_meta', action='store_true',
+                        help='Write view_XX_meta.json and require tar+meta for completion')
     args = parser.parse_args()
+
+    if args.max_frames < 0:
+        parser.error('--max_frames must be >= 0')
 
     resolutions = [int(x) for x in args.resolution.split(',')]
     print(f"Resolutions: {resolutions}")
+    print(
+        f"Frame selection: mode={args.frame_sampling} max_frames={args.max_frames} "
+        f"write_meta={args.write_frame_meta}"
+    )
     if args.debug:
         print("[DEBUG MODE] Only 1 view and 1 frame per object")
     os.makedirs(args.tmp_dir, exist_ok=True)
@@ -350,7 +474,18 @@ def main():
     skipped_views = 0
     for s, o, v in my_views:
         view_key = f"{s}/{o}/view_{v:02d}"
-        if view_key in progress and progress[view_key].get('status') == 'success':
+        progress_success = (
+            view_key in progress and progress[view_key].get('status') == 'success'
+        )
+        outputs_complete = view_outputs_complete(
+            args.output_root,
+            resolutions,
+            s,
+            o,
+            v,
+            require_meta=args.write_frame_meta,
+        )
+        if progress_success and outputs_complete:
             skipped_views += 1
             continue
         to_process.append((s, o, v))
@@ -379,6 +514,9 @@ def main():
                 resolutions=resolutions,
                 tmp_dir=args.tmp_dir,
                 debug=args.debug,
+                max_frames=args.max_frames,
+                frame_sampling=args.frame_sampling,
+                write_frame_meta=args.write_frame_meta,
             )
             view_key = f"{shard_id}/{obj_id}/view_{view_idx:02d}"
             progress[view_key] = result
@@ -397,6 +535,9 @@ def main():
             resolutions=resolutions,
             tmp_dir=args.tmp_dir,
             debug=args.debug,
+            max_frames=args.max_frames,
+            frame_sampling=args.frame_sampling,
+            write_frame_meta=args.write_frame_meta,
         )
         with Pool(processes=args.max_workers, maxtasksperchild=1) as pool:
             results_iter = pool.imap_unordered(worker_fn, to_process)
