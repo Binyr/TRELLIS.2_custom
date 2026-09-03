@@ -19,15 +19,30 @@ RES_TAG="${RESOLUTIONS//,/_}"
 DATA_ROOT="${DATA_ROOT:-/threed-code/yanruibin/efs/4D_video_data_process/data}"
 RENDERED_ROOT="$DATA_ROOT/objverse_minghao_4d_mine_40075/rendering_v5"
 OUTPUT_ROOT="$DATA_ROOT/trellis.2/dual_grid_4d_v3"
+if [[ -z "${S3_OUTPUT_ROOT:-}" ]]; then
+    case "$OUTPUT_ROOT" in
+        /threed-code/*)
+            S3_OUTPUT_ROOT="s3://arcwm-code-us-west-2/${OUTPUT_ROOT#/threed-code/}"
+            ;;
+        s3://*)
+            S3_OUTPUT_ROOT="$OUTPUT_ROOT"
+            ;;
+        *)
+            S3_OUTPUT_ROOT=""
+            ;;
+    esac
+fi
 ANN_FILE="$DATA_ROOT/objverse_minghao_4d_mine_40075/rendering_v5_anns_8cam.json"
 PRIORITY_LIST="${PRIORITY_LIST:-claude_tmp/objv1_sketchfab_intersection.txt}"
-MAX_WORKERS="${MAX_WORKERS:-1}"
 TMP_DIR="${TMP_DIR:-/local-ssd/tmp_dual_grid_4d_${RES_TAG}}"
 
 LOCAL_STDOUT_DIR="/local-ssd/dual_grid_4d_${RES_TAG}_stdouts"
 LOCAL_LOG="$LOCAL_STDOUT_DIR/rank_${RANK}.log"
-REMOTE_STDOUT_DIR="$OUTPUT_ROOT/log_${RES_TAG}/std_outs"
-REMOTE_LOG="$REMOTE_STDOUT_DIR/rank_${RANK}.log"
+if [[ -n "$S3_OUTPUT_ROOT" ]]; then
+    REMOTE_LOG="$S3_OUTPUT_ROOT/log_${RES_TAG}/std_outs/rank_${RANK}.log"
+else
+    REMOTE_LOG="$OUTPUT_ROOT/log_${RES_TAG}/std_outs/rank_${RANK}.log"
+fi
 STDOUT_SYNC_INTERVAL="${STDOUT_SYNC_INTERVAL:-60}"
 
 # Optional only: set this to a finished-view list built specifically for the
@@ -41,8 +56,12 @@ mkdir -p "$LOCAL_STDOUT_DIR" "$TMP_DIR"
 
 sync_stdout() {
     if [[ -f "$LOCAL_LOG" ]]; then
-        mkdir -p "$REMOTE_STDOUT_DIR"
-        cp "$LOCAL_LOG" "$REMOTE_LOG"
+        if [[ "$REMOTE_LOG" == s3://* ]]; then
+            aws s3 cp --only-show-errors "$LOCAL_LOG" "$REMOTE_LOG"
+        else
+            mkdir -p "$(dirname "$REMOTE_LOG")"
+            cp "$LOCAL_LOG" "$REMOTE_LOG"
+        fi
     fi
 }
 
@@ -68,7 +87,6 @@ echo "  resolutions:    $RESOLUTIONS"
 echo "  rendered_root:  $RENDERED_ROOT"
 echo "  output_root:    $OUTPUT_ROOT"
 echo "  finished_views: ${FINISHED_VIEWS:-<unset>}"
-echo "  max_workers:    $MAX_WORKERS"
 echo "  tmp_dir:        $TMP_DIR"
 echo "  local_log:      $LOCAL_LOG"
 echo "  remote_log:     $REMOTE_LOG"
@@ -79,7 +97,6 @@ python -u data_toolkit/dual_grid_v2.py \
     --rendered_root "$RENDERED_ROOT" \
     --output_root "$OUTPUT_ROOT" \
     --resolution "$RESOLUTIONS" \
-    --max_workers "$MAX_WORKERS" \
     --max_frames 32 \
     --frame_sampling center \
     --write_frame_meta \

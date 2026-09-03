@@ -8,7 +8,7 @@ via o_voxel.convert.mesh_to_flexible_dual_grid().
 Features:
 - Per-view scheduling granularity: each task = one (object, view) pair
 - View-level checkpoint-based resume via progress_{rank}.json
-- Multi-process parallel processing (--max_workers)
+- Single-process per rank (matching dual_grid_dynamic_obj.py)
 - Distributed sharding (--rank / --world_size)
 
 Usage:
@@ -17,7 +17,6 @@ Usage:
         --rendered_root data/objverse_minghao_4d_mine_40075/rendering_v5 \
         --output_root data/trellis.2/dual_grid_4d \
         --resolution 1024 \
-        --max_workers 8 \
         --rank 0 --world_size 1
 """
 
@@ -25,11 +24,12 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import tarfile
 import time
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
-from multiprocessing import Pool
-from functools import partial
 
 import numpy as np
 import torch
@@ -39,6 +39,107 @@ import o_voxel
 
 # Expected views: stride=2, start=0, 16 cameras -> views 0,2,4,6,8,10,12,14
 EXPECTED_VIEWS = [0, 2, 4, 6, 8, 10, 12, 14]
+
+TERMINAL_SKIP_STATUSES = {
+    'success',
+    'skipped_too_many_faces',
+    'invalid_mesh_nonfinite',
+    'missing_mesh',
+    'missing_camera',
+    'frame_metadata_mismatch',
+    'dual_grid_error',
+    'worker_error',
+}
+
+ERROR_STATUSES = {
+    'invalid_mesh_nonfinite',
+    'frame_metadata_mismatch',
+    'dual_grid_error',
+    'worker_error',
+    'upload_failed',
+}
+
+
+def s3_uri_for_path(path: str) -> str | None:
+    """Map the /threed-code mount to its backing S3 URI."""
+    if path.startswith('s3://'):
+        return path
+    mount_prefix = '/threed-code/'
+    if path.startswith(mount_prefix):
+        return 's3://arcwm-code-us-west-2/' + path[len(mount_prefix):]
+    return None
+
+
+def aws_s3_cp(src: str, dst: str, retries: int = 2) -> None:
+    """Copy with the native AWS CLI when either endpoint is S3-backed."""
+    src_arg = s3_uri_for_path(src) or src
+    dst_arg = s3_uri_for_path(dst) or dst
+    last_error = ''
+    for attempt in range(retries + 1):
+        proc = subprocess.run(
+            ['aws', 's3', 'cp', '--only-show-errors', src_arg, dst_arg],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            return
+        last_error = proc.stderr.strip()
+        if attempt < retries:
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(
+        f'aws s3 cp failed after {retries + 1} attempts: '
+        f'{src_arg} -> {dst_arg}: {last_error[:500]}'
+    )
+
+
+def publish_file(local_path: str, output_path: str) -> None:
+    """Publish output without writing through an S3 FUSE mount."""
+    if s3_uri_for_path(output_path) is not None:
+        aws_s3_cp(local_path, output_path)
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    shutil.copyfile(local_path, output_path)
+
+
+def fetch_file(remote_path: str, local_path: str) -> bool:
+    """Fetch prior state; a missing remote file is a normal first-run case."""
+    if s3_uri_for_path(remote_path) is None:
+        if not os.path.exists(remote_path):
+            return False
+        os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+        shutil.copyfile(remote_path, local_path)
+        return True
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+        aws_s3_cp(remote_path, local_path, retries=0)
+        return True
+    except RuntimeError:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+        return False
+
+
+def output_file_exists(path: str) -> bool:
+    """Check S3-backed outputs through the native AWS CLI."""
+    s3_uri = s3_uri_for_path(path)
+    if s3_uri is None:
+        return os.path.exists(path)
+    filename = s3_uri.rsplit('/', 1)[-1]
+    last_error = ''
+    for attempt in range(2):
+        proc = subprocess.run(
+            ['aws', 's3', 'ls', s3_uri],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            return filename in proc.stdout
+        last_error = proc.stderr.strip()
+        if attempt == 0:
+            time.sleep(2)
+    if last_error:
+        print(f'[WARN] aws s3 ls failed for {s3_uri}: {last_error[:300]}')
+    return False
 
 
 def pick_frame_sel(num_frames: int, max_frames: int, mode: str) -> list[int]:
@@ -65,25 +166,6 @@ def parse_entry(entry: str):
     shard_with_suffix = parts[-2]
     shard_id = shard_with_suffix.split('_static_camera_distance_v3')[0]
     return shard_id, obj_id
-
-
-def view_outputs_complete(
-    output_root: str,
-    resolutions: list[int],
-    shard_id: str,
-    obj_id: str,
-    view_idx: int,
-    require_meta: bool,
-) -> bool:
-    for res in resolutions:
-        output_dir = os.path.join(output_root, str(res), shard_id, obj_id)
-        tar_path = os.path.join(output_dir, f'view_{view_idx:02d}.tar')
-        meta_path = os.path.join(output_dir, f'view_{view_idx:02d}_meta.json')
-        if not os.path.exists(tar_path):
-            return False
-        if require_meta and not os.path.exists(meta_path):
-            return False
-    return True
 
 
 def load_camera_w2c_rotations(rendered_dir: str, view_start=0, view_stride=2):
@@ -117,6 +199,7 @@ def dual_grid_one_view(
     resolutions: list,
     tmp_dir: str = '/tmp',
     debug: bool = False,
+    max_face_count: int = 500_000,
     max_frames: int = 0,
     frame_sampling: str = 'center',
     write_frame_meta: bool = False,
@@ -132,8 +215,18 @@ def dual_grid_one_view(
     if not os.path.exists(mesh_npz_path):
         return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'missing_mesh', 'num_frames': 0}
 
-    # Load camera rotation for this view
-    t_read_start = time.time()
+    # This source is already mounted, so t_get is zero; camera/NPZ reads are
+    # accounted as t_load_mesh to match dual_grid_dynamic_obj timing fields.
+    timings = {
+        't_get': 0.0,
+        't_load_mesh': 0.0,
+        't_compute': 0.0,
+        't_write_vxz': 0.0,
+        't_tar': 0.0,
+        't_upload_tar': 0.0,
+        't_upload_meta': 0.0,
+    }
+    t_load_start = time.time()
     camera_views = load_camera_w2c_rotations(rendered_dir)
     if camera_views is None or view_idx not in camera_views:
         return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'missing_camera', 'num_frames': 0}
@@ -148,10 +241,25 @@ def dual_grid_one_view(
             if 'frame_indices' in mesh_data.files
             else None
         )
-    t_read = time.time() - t_read_start
+    timings['t_load_mesh'] = time.time() - t_load_start
 
-    num_faces = faces.shape[0]
-    if num_faces > 500000:
+    num_faces = int(faces.shape[0])
+    nonfinite_vertices = int(vertices_seq.size - np.isfinite(vertices_seq).sum())
+    nonfinite_faces = int(faces.size - np.isfinite(faces).sum())
+    if nonfinite_vertices or nonfinite_faces:
+        return {
+            'shard_id': shard_id,
+            'obj_id': obj_id,
+            'view_idx': view_idx,
+            'status': 'invalid_mesh_nonfinite',
+            'num_frames': 0,
+            'num_faces': num_faces,
+            'vertices_shape': list(vertices_seq.shape),
+            'faces_shape': list(faces.shape),
+            'nonfinite_vertices': nonfinite_vertices,
+            'nonfinite_faces': nonfinite_faces,
+        }
+    if num_faces > max_face_count:
         return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'skipped_too_many_faces', 'num_frames': 0, 'num_faces': num_faces}
 
     num_frames_orig = int(vertices_seq.shape[0])
@@ -175,18 +283,18 @@ def dual_grid_one_view(
     faces_t = torch.from_numpy(faces).long()
 
     view_status = 'success'
-    t_compute = 0.0
-    t_write = 0.0
+    view_errors = []
     for res in resolutions:
         output_dir = os.path.join(output_root, str(res), shard_id, obj_id)
-        os.makedirs(output_dir, exist_ok=True)
+        if s3_uri_for_path(output_dir) is None:
+            os.makedirs(output_dir, exist_ok=True)
         tar_path = os.path.join(output_dir, f'view_{view_idx:02d}.tar')
         meta_path = os.path.join(output_dir, f'view_{view_idx:02d}_meta.json')
 
         # Frame-aware outputs use the sidecar as the completion marker. Existing
         # all-frame pipelines retain their historical tar-only resume behavior.
-        output_complete = os.path.exists(tar_path) and (
-            not write_frame_meta or os.path.exists(meta_path)
+        output_complete = output_file_exists(tar_path) and (
+            not write_frame_meta or output_file_exists(meta_path)
         )
         if output_complete:
             continue
@@ -223,21 +331,29 @@ def dual_grid_one_view(
                 dual_vertices = torch.clamp(dual_vertices, 0, 1)
                 dual_vertices = (dual_vertices * 255).type(torch.uint8)
                 intersected = (intersected[:, 0:1] + 2 * intersected[:, 1:2] + 4 * intersected[:, 2:3]).type(torch.uint8)
-                t_compute += time.time() - t0
+                timings['t_compute'] += time.time() - t0
                 t_compute_cur = time.time() - t0
                 t0 = time.time()
                 o_voxel.io.write_vxz(
                     local_vxz_path,
                     voxel_indices,
                     {'vertices': dual_vertices, 'intersected': intersected},
+                    compression='zstd',
+                    compression_level=5,
                 )
                 t_write_cur = time.time() - t0
-                t_write += t_write_cur
+                timings['t_write_vxz'] += t_write_cur
                 frame_files.append((frame_idx, local_vxz_path))
                 print(f"t_write: {t_write_cur:.3f}s, t_compute_cur: {t_compute_cur:.3f}s")
             except Exception as e:
                 print(f"[ERROR] dual_grid failed: {shard_id}/{obj_id} view={view_idx} frame={frame_idx} res={res}: {e}")
-                view_status = 'error'
+                view_status = 'dual_grid_error'
+                view_errors.append({
+                    'frame_idx': int(frame_idx),
+                    'resolution': int(res),
+                    'error': f'{type(e).__name__}: {e}',
+                    'traceback': traceback.format_exc(),
+                })
                 continue
             finally:
                 del verts_t
@@ -255,7 +371,7 @@ def dual_grid_one_view(
                 for fi, fpath in sorted(frame_files):
                     tar.add(fpath, arcname=f'{fi:06d}.vxz')
             t_tar = time.time() - t0
-            t0 = time.time()
+            timings['t_tar'] += t_tar
             if write_frame_meta:
                 local_meta_path = os.path.join(local_view_dir, 'view_meta.json')
                 source_animation_frames = (
@@ -281,38 +397,96 @@ def dual_grid_one_view(
                         'vxz_frame_ids': [int(i) for i in frame_sel],
                         'rgb_mp4': f'result_rgb_mp4/view_{view_idx:02d}.mp4',
                     }, f)
+                # Publish tar first and metadata last; both are required for
+                # frame-aware resume, so a partial upload is never complete.
+                t0 = time.time()
                 try:
-                    # Publish tar first and metadata last; both are required for
-                    # frame-aware resume, so a partial copy is never complete.
-                    shutil.copy2(local_tar_path, tar_path)
-                    shutil.copy2(local_meta_path, meta_path)
+                    publish_file(local_tar_path, tar_path)
                 except Exception as exc:
-                    print(
-                        f'[ERROR] output copy failed: {shard_id}/{obj_id} '
-                        f'view={view_idx} res={res}: {exc}'
-                    )
-                    view_status = 'error'
+                    timings['t_upload_tar'] += time.time() - t0
+                    shutil.rmtree(local_view_dir, ignore_errors=True)
+                    return {
+                        'shard_id': shard_id, 'obj_id': obj_id,
+                        'view_idx': view_idx, 'status': 'upload_failed',
+                        'stage': 'tar', 'resolution': int(res),
+                        'error': str(exc), 'num_frames': num_frames,
+                        'num_frames_orig': num_frames_orig,
+                        'frame_sampling': frame_sampling,
+                        'frame_sel': [int(i) for i in frame_sel],
+                    }
+                timings['t_upload_tar'] += time.time() - t0
+                t0 = time.time()
+                try:
+                    publish_file(local_meta_path, meta_path)
+                except Exception as exc:
+                    timings['t_upload_meta'] += time.time() - t0
+                    shutil.rmtree(local_view_dir, ignore_errors=True)
+                    return {
+                        'shard_id': shard_id, 'obj_id': obj_id,
+                        'view_idx': view_idx, 'status': 'upload_failed',
+                        'stage': 'meta', 'resolution': int(res),
+                        'error': str(exc), 'num_frames': num_frames,
+                        'num_frames_orig': num_frames_orig,
+                        'frame_sampling': frame_sampling,
+                        'frame_sel': [int(i) for i in frame_sel],
+                    }
+                timings['t_upload_meta'] += time.time() - t0
             else:
-                os.system(f'cp "{local_tar_path}" "{tar_path}"')
-            t_cp = time.time() - t0
-            t_write += t_tar + t_cp
-            print(f"[TIMING] tar={t_tar:.3f}s cp={t_cp:.3f}s")
+                t0 = time.time()
+                try:
+                    publish_file(local_tar_path, tar_path)
+                except Exception as exc:
+                    timings['t_upload_tar'] += time.time() - t0
+                    shutil.rmtree(local_view_dir, ignore_errors=True)
+                    return {
+                        'shard_id': shard_id, 'obj_id': obj_id,
+                        'view_idx': view_idx, 'status': 'upload_failed',
+                        'stage': 'tar', 'resolution': int(res),
+                        'error': str(exc), 'num_frames': num_frames,
+                        'num_frames_orig': num_frames_orig,
+                        'frame_sampling': frame_sampling,
+                        'frame_sel': [int(i) for i in frame_sel],
+                    }
+                timings['t_upload_tar'] += time.time() - t0
+            print(
+                f"[TIMING] res={res} tar={t_tar:.3f}s "
+                f"upload_tar={timings['t_upload_tar']:.3f}s "
+                f"upload_meta={timings['t_upload_meta']:.3f}s"
+            )
         elif write_frame_meta:
             print(
                 f'[ERROR] refusing partial output: {shard_id}/{obj_id} '
                 f'view={view_idx} res={res} frames={len(frame_files)}/{num_frames}'
             )
-            view_status = 'error'
+            view_status = 'dual_grid_error'
 
         # Clean up local temp dir
         shutil.rmtree(local_view_dir, ignore_errors=True)
 
     del vertices_seq, faces, faces_t
-    print(f"[TIMING] {shard_id}/{obj_id}/view_{view_idx:02d} read={t_read:.1f}s compute={t_compute:.1f}s write={t_write:.1f}s total={t_read+t_compute+t_write:.1f}s frames={num_frames}")
-    return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': view_status, 'num_frames': num_frames,
-            'num_frames_orig': num_frames_orig, 'frame_sampling': frame_sampling,
-            'frame_sel': [int(i) for i in frame_sel],
-            't_read': round(t_read, 2), 't_compute': round(t_compute, 2), 't_write': round(t_write, 2)}
+    total_time = sum(timings.values())
+    print(
+        f"[TIMING] {shard_id}/{obj_id}/view_{view_idx:02d} "
+        f"get={timings['t_get']:.1f}s load={timings['t_load_mesh']:.1f}s "
+        f"compute={timings['t_compute']:.1f}s "
+        f"write_vxz={timings['t_write_vxz']:.1f}s "
+        f"tar={timings['t_tar']:.1f}s "
+        f"upload_tar={timings['t_upload_tar']:.1f}s "
+        f"upload_meta={timings['t_upload_meta']:.1f}s "
+        f"total={total_time:.1f}s frames={num_frames}"
+    )
+    return {
+        'shard_id': shard_id,
+        'obj_id': obj_id,
+        'view_idx': view_idx,
+        'status': view_status,
+        'num_frames': num_frames,
+        'num_frames_orig': num_frames_orig,
+        'frame_sampling': frame_sampling,
+        'frame_sel': [int(i) for i in frame_sel],
+        'errors': view_errors or None,
+        **{key: round(value, 2) for key, value in timings.items()},
+    }
 
 
 def load_progress(progress_path: str) -> dict:
@@ -324,26 +498,51 @@ def load_progress(progress_path: str) -> dict:
 
 
 def save_progress(progress_path: str, progress: dict):
-    with open(progress_path, 'w') as f:
+    tmp_path = progress_path + '.tmp'
+    with open(tmp_path, 'w') as f:
         json.dump(progress, f)
+    os.replace(tmp_path, progress_path)
 
 
 def append_status_log(status_log_path: str, line: str):
-    """Append a line to status log. Uses read+write instead of 'a' mode for S3 compatibility."""
-    existing = ''
-    if os.path.exists(status_log_path):
-        try:
-            with open(status_log_path, 'r') as f:
-                existing = f.read()
-        except Exception:
-            pass
-    with open(status_log_path, 'w') as f:
-        f.write(existing + line + '\n')
+    """Append a line to the local status log."""
+    with open(status_log_path, 'a') as f:
+        f.write(line.rstrip('\n') + '\n')
+
+
+def publish_error_log(
+    local_log_dir: str,
+    remote_log_dir: str,
+    rank: int,
+    view_key: str,
+    result: dict,
+) -> None:
+    """Publish a structured per-view diagnostic without failing the worker."""
+    safe_key = view_key.replace('/', '__')
+    local_dir = os.path.join(local_log_dir, 'errors', f'rank_{rank}')
+    os.makedirs(local_dir, exist_ok=True)
+    local_path = os.path.join(local_dir, f'{safe_key}.json')
+    remote_path = os.path.join(
+        remote_log_dir, 'errors', f'rank_{rank}', f'{safe_key}.json'
+    )
+    payload = {
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'rank': int(rank),
+        'view_key': view_key,
+        'result': result,
+    }
+    with open(local_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+    try:
+        publish_file(local_path, remote_path)
+    except Exception as exc:
+        print(f'[WARN] error-log upload failed for {view_key}: {exc}')
 
 
 def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, tmp_dir='/tmp', debug=False,
-                    max_frames=0, frame_sampling='center', write_frame_meta=False):
-    """Wrapper for Pool.imap_unordered: processes one (shard_id, obj_id, view_idx) task."""
+                    max_face_count=500_000, max_frames=0, frame_sampling='center',
+                    write_frame_meta=False):
+    """Run one task with worker-level error capture and scratch cleanup."""
     shard_id, obj_id, view_idx = args_tuple
     try:
         return dual_grid_one_view(
@@ -355,13 +554,25 @@ def _worker_wrapper(args_tuple, rendered_root, output_root, resolutions, tmp_dir
             resolutions=resolutions,
             tmp_dir=tmp_dir,
             debug=debug,
+            max_face_count=max_face_count,
             max_frames=max_frames,
             frame_sampling=frame_sampling,
             write_frame_meta=write_frame_meta,
         )
     except Exception as e:
         print(f"[ERROR] {shard_id}/{obj_id}/view_{view_idx:02d}: {e}")
-        return {'shard_id': shard_id, 'obj_id': obj_id, 'view_idx': view_idx, 'status': 'error', 'error': str(e)}
+        return {
+            'shard_id': shard_id,
+            'obj_id': obj_id,
+            'view_idx': view_idx,
+            'status': 'worker_error',
+            'error': f'{type(e).__name__}: {e}',
+            'traceback': traceback.format_exc(),
+        }
+    finally:
+        prefix = f'{shard_id}_{obj_id}_view{view_idx:02d}_res'
+        for path in Path(tmp_dir).glob(prefix + '*'):
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def main():
@@ -382,7 +593,9 @@ def main():
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--world_size', type=int, default=1)
     parser.add_argument('--max_workers', type=int, default=1,
-                        help='Number of parallel processes')
+                        help='Deprecated compatibility option; processing is single-process')
+    parser.add_argument('--max_face_count', type=int, default=500_000,
+                        help='Skip meshes with more than this many faces')
     parser.add_argument('--priority_list', type=str, default=None,
                         help='Path to file with priority obj_ids (one per line), these will be processed first')
     parser.add_argument('--finished_views', type=str, default=None,
@@ -402,6 +615,11 @@ def main():
 
     if args.max_frames < 0:
         parser.error('--max_frames must be >= 0')
+    if args.max_workers != 1:
+        print(
+            f'[WARN] --max_workers={args.max_workers} is deprecated and ignored; '
+            'dual-grid processing is single-process'
+        )
 
     resolutions = [int(x) for x in args.resolution.split(',')]
     print(f"Resolutions: {resolutions}")
@@ -426,11 +644,13 @@ def main():
 
     print(f"Total entries (objects): {len(entries)}")
 
-    # Log directory: output_root/log_{resolution}/
+    # Keep mutable rank state local and publish snapshots through native S3.
     res_tag = args.resolution.replace(',', '_')
-    log_dir = os.path.join(args.output_root, f'log_{res_tag}')
+    remote_log_dir = os.path.join(args.output_root, f'log_{res_tag}')
+    log_dir = os.path.join(args.tmp_dir, '_state', f'log_{res_tag}')
     os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(args.output_root, exist_ok=True)
+    if s3_uri_for_path(args.output_root) is None:
+        os.makedirs(args.output_root, exist_ok=True)
 
     # Build full per-view task list (deterministic order)
     views_to_use = EXPECTED_VIEWS if not args.debug else EXPECTED_VIEWS[:1]
@@ -467,6 +687,8 @@ def main():
 
     # Per-rank progress file
     progress_path = os.path.join(log_dir, f'progress_{args.rank}.json')
+    remote_progress_path = os.path.join(remote_log_dir, f'progress_{args.rank}.json')
+    fetch_file(remote_progress_path, progress_path)
     progress = load_progress(progress_path)
 
     # THEN filter out completed views (only check this rank's progress)
@@ -474,18 +696,8 @@ def main():
     skipped_views = 0
     for s, o, v in my_views:
         view_key = f"{s}/{o}/view_{v:02d}"
-        progress_success = (
-            view_key in progress and progress[view_key].get('status') == 'success'
-        )
-        outputs_complete = view_outputs_complete(
-            args.output_root,
-            resolutions,
-            s,
-            o,
-            v,
-            require_meta=args.write_frame_meta,
-        )
-        if progress_success and outputs_complete:
+        progress_status = progress.get(view_key, {}).get('status', '')
+        if progress_status in TERMINAL_SKIP_STATUSES:
             skipped_views += 1
             continue
         to_process.append((s, o, v))
@@ -497,62 +709,66 @@ def main():
         return
 
     status_log_path = os.path.join(log_dir, f'status_{args.rank}.log')
+    remote_status_log_path = os.path.join(remote_log_dir, f'status_{args.rank}.log')
+    fetch_file(remote_status_log_path, status_log_path)
     total_to_process = len(to_process)
     completed_count = 0
     start_time = time.time()
+    state_updates_since_push = 0
+    last_state_push_time = 0.0
 
-    # Process
-    if args.max_workers <= 1:
-        # Single process
-        for shard_id, obj_id, view_idx in tqdm(to_process, desc="Dual grid 4D"):
-            result = dual_grid_one_view(
-                shard_id=shard_id,
-                obj_id=obj_id,
-                view_idx=view_idx,
-                rendered_root=args.rendered_root,
-                output_root=args.output_root,
-                resolutions=resolutions,
-                tmp_dir=args.tmp_dir,
-                debug=args.debug,
-                max_frames=args.max_frames,
-                frame_sampling=args.frame_sampling,
-                write_frame_meta=args.write_frame_meta,
-            )
-            view_key = f"{shard_id}/{obj_id}/view_{view_idx:02d}"
-            progress[view_key] = result
-            save_progress(progress_path, progress)
-            completed_count += 1
-            elapsed = time.time() - start_time
-            avg_per_view = elapsed / completed_count
-            eta = avg_per_view * (total_to_process - completed_count)
-            append_status_log(status_log_path, f"{view_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg_per_view:.1f}s/view eta={eta:.0f}s")
-    else:
-        # Multi-process with worker recycling to prevent memory leaks
-        worker_fn = partial(
-            _worker_wrapper,
+    def publish_state(force: bool = False):
+        nonlocal state_updates_since_push, last_state_push_time
+        now = time.time()
+        if not force and state_updates_since_push < 8 and now - last_state_push_time < 30:
+            return
+        try:
+            publish_file(progress_path, remote_progress_path)
+            publish_file(status_log_path, remote_status_log_path)
+        except Exception as exc:
+            print(f'[WARN] progress/status upload failed: {exc}')
+        state_updates_since_push = 0
+        last_state_push_time = now
+
+    def record_result(view_key: str, result: dict, status_line: str):
+        nonlocal state_updates_since_push
+        result.setdefault('updated_at', datetime.now(timezone.utc).isoformat())
+        progress[view_key] = result
+        save_progress(progress_path, progress)
+        append_status_log(status_log_path, status_line)
+        if result.get('status') in ERROR_STATUSES:
+            publish_error_log(log_dir, remote_log_dir, args.rank, view_key, result)
+        state_updates_since_push += 1
+        publish_state()
+
+    # Process one view at a time, matching dual_grid_dynamic_obj.py.
+    for shard_id, obj_id, view_idx in tqdm(to_process, desc="Dual grid 4D"):
+        result = _worker_wrapper(
+            (shard_id, obj_id, view_idx),
             rendered_root=args.rendered_root,
             output_root=args.output_root,
             resolutions=resolutions,
             tmp_dir=args.tmp_dir,
             debug=args.debug,
+            max_face_count=args.max_face_count,
             max_frames=args.max_frames,
             frame_sampling=args.frame_sampling,
             write_frame_meta=args.write_frame_meta,
         )
-        with Pool(processes=args.max_workers, maxtasksperchild=1) as pool:
-            results_iter = pool.imap_unordered(worker_fn, to_process)
-            with tqdm(total=total_to_process, desc="Dual grid 4D") as pbar:
-                for result in results_iter:
-                    view_key = f"{result['shard_id']}/{result['obj_id']}/view_{result['view_idx']:02d}"
-                    progress[view_key] = result
-                    save_progress(progress_path, progress)
-                    completed_count += 1
-                    elapsed = time.time() - start_time
-                    avg_per_view = elapsed / completed_count
-                    eta = avg_per_view * (total_to_process - completed_count)
-                    append_status_log(status_log_path, f"{view_key} {result['status']} frames={result.get('num_frames', 0)} done={completed_count}/{total_to_process} avg={avg_per_view:.1f}s/view eta={eta:.0f}s")
-                    pbar.set_postfix_str(f"avg={avg_per_view:.1f}s/view eta={eta:.0f}s")
-                    pbar.update(1)
+        view_key = f"{shard_id}/{obj_id}/view_{view_idx:02d}"
+        completed_count += 1
+        elapsed = time.time() - start_time
+        avg_per_view = elapsed / completed_count
+        eta = avg_per_view * (total_to_process - completed_count)
+        record_result(
+            view_key,
+            result,
+            f"{datetime.now(timezone.utc).isoformat()} {view_key} {result['status']} "
+            f"frames={result.get('num_frames', 0)} "
+            f"done={completed_count}/{total_to_process} avg={avg_per_view:.1f}s/view eta={eta:.0f}s",
+        )
+
+    publish_state(force=True)
 
     # Summary
     statuses = {}
