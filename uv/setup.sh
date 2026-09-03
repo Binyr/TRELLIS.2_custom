@@ -332,6 +332,17 @@ echo "[INSTALL] cumesh, flex_gemm, o-voxel (pre-built wheels)..."
 uv_pip_install_yanruibin_s3 /threed-code/yanruibin/efs/packages/cumesh-0.0.1-cp312-cp312-linux_x86_64.whl
 uv_pip_install_yanruibin_s3 /threed-code/yanruibin/efs/packages/flex_gemm-1.0.0-cp312-cp312-linux_x86_64.whl
 uv_pip_install_yanruibin_s3 /threed-code/yanruibin/efs/packages/o_voxel-0.0.1-cp312-cp312-linux_x86_64.whl --no-deps
+# The published o_voxel 0.0.1 wheel eagerly imports postprocess, which imports
+# flex_gemm and initializes CUDA even for the CPU mesh_to_flexible_dual_grid
+# path. Overlay the package initializer with the source-tree lazy-import fix;
+# the compiled extension and all other wheel contents remain unchanged.
+O_VOXEL_SITE_DIR="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')/o_voxel"
+if [ ! -d "$O_VOXEL_SITE_DIR" ] ; then
+    echo "[INSTALL] o_voxel package directory not found: $O_VOXEL_SITE_DIR" >&2
+    return 2>/dev/null || exit 1
+fi
+install -m 0644 o-voxel/o_voxel/__init__.py "$O_VOXEL_SITE_DIR/__init__.py"
+echo "[INSTALL] Applied o_voxel lazy-import initializer"
 uv pip install plyfile zstandard
 uv pip install natsort
 
